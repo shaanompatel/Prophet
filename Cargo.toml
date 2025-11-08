@@ -1,0 +1,7 @@
+# prophet/Cargo.toml  (root)
+[workspace]
+members = [
+    "onchain/prophet_market_program",
+    "offchain/prophet_bridge",
+]
+resolver = "2"

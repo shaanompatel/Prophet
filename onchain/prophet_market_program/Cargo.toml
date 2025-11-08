@@ -1,0 +1,17 @@
+[package]
+name = "prophet_market_program"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "prophet_market_program"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+solana-program = "1.18.0"
+borsh = "0.10.4"
+borsh-derive = "0.10.4"
+spl-token = { version = "4.0.0", features = ["no-entrypoint"] }
+
+[profile.release]
+opt-level = "s"
