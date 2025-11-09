@@ -9,5 +9,5 @@ backend/X/X/x_scraping/tweets.log
 backend/X/X/x_scraping/markets.log
 *.log
 log/
-pid/
+pids/
 backend/X/X/x_scraping/since_id.json

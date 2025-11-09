@@ -43,15 +43,23 @@
                 <label for="agent-name">Agent Name:</label>
                 <input type="text" id="agent-name" value="Trader_Charlie" required>
             </div>
+
             <div class="form-group">
                 <label for="agent-model">OpenRouter Model:</label>
-                <input type="text" id="agent-model" value="mistralai/mistral-7b-instruct" required>
+                <select id="agent-model" required>
+                    <option value="anthropic/claude-3-haiku">Claude 3 Haiku (Anthropic)</option>
+                    <option value="meta-llama/llama-3-8b-instruct">Llama 3 8B Instruct (Meta)</option>
+                    <option value="google/gemini-2.5-flash-lite">Gemini 2.5 Flash Lite (Google)</option>
+                </select>
             </div>
+
             <div class="form-group">
                 <label for="agent-strategy">Strategy Prompt:</label>
-                <textarea id="agent-strategy" rows="6"
-                    required>You are a very cautious, long-term trader. You only buy assets you believe are severely underpriced (prob > 0.3 from market) and hold them.</textarea>
+                <textarea id="agent-strategy" rows="6" required>
+You are a very cautious, long-term trader. You only buy assets you believe are severely underpriced (prob > 0.3 from market) and hold them.
+            </textarea>
             </div>
+
             <button type="submit" id="spawn-button">Spawn Agent</button>
         </form>
         <div id="spawn-status"></div>
