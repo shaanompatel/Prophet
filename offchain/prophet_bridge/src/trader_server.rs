@@ -90,6 +90,8 @@ pub struct TraderServer {
     conns: Arc<Mutex<HashMap<String, TraderConn>>>,
     // connected spectators (frontend dashboards, etc.)
     spectators: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<serde_json::Value>>>>,
+    // connected agent managers (controller that can spawn agents)
+    managers: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<serde_json::Value>>>>,
 }
 
 impl TraderServer {
@@ -104,8 +106,10 @@ impl TraderServer {
             payer,
             conns: Arc::new(Mutex::new(HashMap::new())),
             spectators: Arc::new(Mutex::new(HashMap::new())),
+            managers: Arc::new(Mutex::new(HashMap::new())),  // <-- add this
         }
     }
+
 
     /// Start WS server and a periodic “price ticker” broadcaster.
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -224,37 +228,43 @@ impl TraderServer {
 
                         println!("[trader-server] registered spectator {sid}");
                     }
-					Ok(InboundMsg::RegisterManager { client_id }) => {
-						let ts = SystemTime::now()
-							.duration_since(std::time::UNIX_EPOCH)
-							.unwrap_or_default()
-							.as_millis();
-						let mid = client_id.unwrap_or_else(|| format!("manager_{ts}"));
+                    Ok(InboundMsg::RegisterManager { client_id }) => {
+                        let ts = SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis();
+                        let mid = client_id.unwrap_or_else(|| format!("manager_{ts}"));
 
-						{
-							// For now, reuse spectators map so manager sees all broadcasts
-							let mut specs = self.spectators.lock().unwrap();
-							specs.insert(mid.clone(), out_tx.clone());
-						}
+                        {
+                            // Reuse spectators map so manager sees all broadcasts
+                            let mut specs = self.spectators.lock().unwrap();
+                            specs.insert(mid.clone(), out_tx.clone());
+                        }
+                        {
+                            // NEW: also track as manager so we can forward spawn commands
+                            let mut mgrs = self.managers.lock().unwrap();
+                            mgrs.insert(mid.clone(), out_tx.clone());
+                        }
 
-						agent_or_spec_id = Some(mid.clone());
-						is_spectator = true;
+                        agent_or_spec_id = Some(mid.clone());
+                        is_spectator = true; // manager cannot trade directly
 
-						let _ = out_tx.send(json!({
-							"type": "manager_registered",
-							"manager_id": mid
-						}));
+                        let _ = out_tx.send(json!({
+                            "type": "manager_registered",
+                            "manager_id": mid
+                        }));
 
-						// Optional: send initial snapshots just like for spectators
-						if let Err(e) = self.push_all_accounts_snapshot_to(&out_tx).await {
-							eprintln!("[trader-server] failed to push account snapshot to manager: {e:?}");
-						}
-						if let Err(e) = self.snapshot_prices_to(&out_tx).await {
-							eprintln!("[trader-server] failed to push price snapshot to manager: {e:?}");
-						}
+                        // Optional: send initial snapshots just like for spectators
+                        if let Err(e) = self.push_all_accounts_snapshot_to(&out_tx).await {
+                            eprintln!("[trader-server] failed to push account snapshot to manager: {e:?}");
+                        }
+                        if let Err(e) = self.snapshot_prices_to(&out_tx).await {
+                            eprintln!("[trader-server] failed to push price snapshot to manager: {e:?}");
+                        }
 
-						println!("[trader-server] registered manager {mid}");
-					}
+                        println!("[trader-server] registered manager {mid}");
+                    }
+
                     _ => {
                         // Require some form of registration first
                         let _ = out_tx.send(json!({
@@ -267,12 +277,45 @@ impl TraderServer {
             }
 
             // From here we have an ID
-            let aid = agent_or_spec_id.clone().unwrap();
+			let aid = agent_or_spec_id.clone().unwrap();
 
-            // spectators don't send trading commands (ignore anything else)
-            if is_spectator {
-                continue;
-            }
+			// First, allow spectators to send "spawn_agent" commands
+			if is_spectator {
+				// Try to parse the raw JSON so we can inspect "action"
+				if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+					if v.get("action").and_then(|a| a.as_str()) == Some("spawn_agent") {
+						println!("[trader-server] received spawn_agent from spectator {aid}");
+
+						// Clone manager map so we don't hold lock while sending
+						let managers = self.managers.lock().unwrap().clone();
+
+						if managers.is_empty() {
+							// No manager connected -> send error back to this spectator only
+							let _ = out_tx.send(json!({
+								"type": "error",
+								"message": "Agent Manager is not connected."
+							}));
+						} else {
+							let msg = json!({
+								"type": "command_spawn_agent",
+								"data": v   // forward entire payload (name, model, strategy, etc.)
+							});
+
+							for (mid, tx) in managers {
+								if tx.send(msg.clone()).is_err() {
+									eprintln!("[trader-server] failed to send spawn command to manager {mid}");
+								}
+							}
+						}
+					}
+					// ignore any other spectator messages
+				} else {
+					eprintln!("[trader-server] invalid JSON from spectator {aid}: {text}");
+				}
+
+				// spectators never send trades directly
+				continue;
+			}
 
             // 1) Try AMM-style "trade" message (quantity sign => side)
             if let Ok(tr) = serde_json::from_str::<TradeMsg>(&text) {
@@ -321,8 +364,17 @@ impl TraderServer {
         write_task.abort();
         if let Some(id) = agent_or_spec_id {
             if is_spectator {
-                self.spectators.lock().unwrap().remove(&id);
-                println!("[trader-server] spectator {id} disconnected");
+                {
+                    self.spectators.lock().unwrap().remove(&id);
+                }
+                let was_manager = {
+                    self.managers.lock().unwrap().remove(&id).is_some()
+                };
+                if was_manager {
+                    println!("[trader-server] manager {id} disconnected");
+                } else {
+                    println!("[trader-server] spectator {id} disconnected");
+                }
             } else {
                 self.conns.lock().unwrap().remove(&id);
                 println!("[trader-server] agent {id} disconnected");
