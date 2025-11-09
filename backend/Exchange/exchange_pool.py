@@ -82,26 +82,39 @@ def get_lmsr_prices(market_name: str) -> dict:
     
     return {"YES": price_yes, "NO": price_no}
 
-async def broadcast_price_update(market_name: str):
+async def broadcast_price_update(market_name: str, individual_client=None):
     """Broadcasts the new AMM prices to all traders."""
     prices = get_lmsr_prices(market_name)
     if "error" in prices:
         return
 
+    market = LMSR_MARKETS[market_name] # Get market to access q values
+
     update_msg = {
         "type": "price_update",
         "market": market_name,
         "price_yes": prices["YES"],
-        "price_no": prices["NO"]
+        "price_no": prices["NO"],
+        "q_yes": market["q_yes"], # Add q values for the UI
+        "q_no": market["q_no"]
     }
-    await broadcast_to_traders(update_msg)
+    
+    if individual_client:
+        # Send to just one client (for syncing on connect)
+        await individual_client.send(json.dumps(update_msg))
+    else:
+        # Broadcast to all
+        await broadcast_to_traders(update_msg)
+    
+    return update_msg # Return the message for the sync handler
 
 # --- REMOVED: get_order_book_update ---
 # --- REMOVED: match_orders ---
 
 async def trader_client_handler(websocket):
-    """Handles new traders connecting to *this* exchange server."""
+    """Handles new traders AND spectators connecting to *this* exchange server."""
     agent_id = None
+    client_type = "trader" # Default
     try:
         async for message in websocket:
             data = json.loads(message)
@@ -124,16 +137,46 @@ async def trader_client_handler(websocket):
                 await send_to_trader(agent_id, {"type": "registered", "agent_id": agent_id})
                 await send_to_trader(agent_id, await get_account_update(agent_id))
             
+            # --- NEW BLOCK FOR THE FRONTEND ---
+            elif action == "register_spectator":
+                client_type = "spectator"
+                # Generate a unique ID for this spectator
+                agent_id = f"spectator_{int(time.time() * 1000)}"
+                CONNECTED_CLIENTS[agent_id] = websocket
+                print(f"[SPECTATOR REGISTER] Spectator connected: {agent_id}")
+                
+                # --- SYNC FULL STATE ---
+                # 1. Send all existing account balances
+                for existing_agent, balances in ACCOUNTS.items():
+                    await send_to_trader(agent_id, {
+                        "type": "account_update", 
+                        "balances": balances,
+                        "agent_id": existing_agent # Manually add agent_id for the frontend
+                    })
+                
+                # 2. Send all existing market prices
+                for market_name in LMSR_MARKETS:
+                    if market_name not in RESOLVED_MARKETS:
+                        await send_to_trader(agent_id, await broadcast_price_update(market_name, individual_client=websocket))
+                
+                await send_to_trader(agent_id, {"type": "spectator_registered"})
+                # This client is now in CONNECTED_CLIENTS and will get all future broadcasts
+            
             elif not agent_id:
                 await websocket.send(json.dumps({"type": "error", "message": "You must register first"}))
                 continue
 
-            # --- UPDATED: 'trade' action instead of 'place_order' ---
             elif action == "trade":
+                if client_type == "spectator": # Spectators can't trade
+                     await websocket.send(json.dumps({"type": "error", "message": "Spectators cannot trade"}))
+                     continue
                 await handle_amm_trade(agent_id, data)
 
     except websockets.exceptions.ConnectionClosed:
-        print(f"[TRADER DISCONNECT] Client {agent_id} disconnected.")
+        if client_type == "spectator":
+             print(f"[SPECTATOR DISCONNECT] Spectator {agent_id} disconnected.")
+        else:
+            print(f"[TRADER DISCONNECT] Client {agent_id} disconnected.")
     finally:
         if agent_id in CONNECTED_CLIENTS:
             del CONNECTED_CLIENTS[agent_id]
@@ -209,16 +252,27 @@ async def handle_amm_trade(agent_id, data):
 
     # --- Notify participants ---
     print(get_exchange_state_string())
+    
+    # Send private update to the trader
     await send_to_trader(agent_id, await get_account_update(agent_id))
-    # await send_to_trader(MAKER_AGENT_ID, await get_account_update(MAKER_AGENT_ID))
+    
+    # --- BROADCAST ACCOUNT UPDATES FOR SPECTATORS ---
+    # We create a custom message here to include the agent_id in the broadcast
+    trader_update = await get_account_update(agent_id)
+    trader_update["agent_id"] = agent_id
+    await broadcast_to_traders(trader_update)
+    
+    maker_update = await get_account_update(MAKER_AGENT_ID)
+    maker_update["agent_id"] = MAKER_AGENT_ID
+    await broadcast_to_traders(maker_update)
+    # --- END OF NEW BLOCK ---
     
     trade_message = {
         "type": "trade_executed", "market": asset_name, "quantity": quantity,
         "agent": agent_id, "cost": trade_cost
     }
     await broadcast_to_traders(trade_message)
-    await broadcast_price_update(market_name)
-
+    await broadcast_price_update(market_name) # This will broadcast to everyone
 
 # --- AI Client Logic (Listens to your script) ---
 
