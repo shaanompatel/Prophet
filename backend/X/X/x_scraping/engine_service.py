@@ -1,30 +1,88 @@
+# engine_service.py
+
 import os
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 from flask import Flask, request, jsonify
-
 from dotenv import load_dotenv
-from pathlib import Path
+
+import asyncio
+import websockets
+
+from market_engine import MarketEngine, LOG_FILE
 
 # load envs before importing MarketEngine so os.getenv works there
 env_path = Path(__file__).parent / "bearerkey.env"
 load_dotenv(dotenv_path=env_path)
 
-from X.x_scraping.market_engine import MarketEngine, LOG_FILE
-from X.x_scraping.market_engine import MarketEngine, LOG_FILE
-
 engine = MarketEngine()
 app = Flask(__name__)
 
+ACTION_SERVER_HOST = "0.0.0.0"
+ACTION_SERVER_PORT = 8766
+
+ACTION_CLIENTS = set()
+
+
+# ------------- websocket action server -------------
+
+async def action_ws_handler(websocket):
+    """
+    Websocket handler for the action server.
+
+    Any client that connects and sends a message will have that message
+    broadcast to all other connected clients. MarketEngine connects as a
+    client and sends JSON actions. Listeners (like sample_market_listener.py)
+    connect and receive those actions.
+    """
+    print(f"[ACTION_SERVER] Client connected: {websocket.remote_address}")
+    ACTION_CLIENTS.add(websocket)
+    try:
+        async for message in websocket:
+            dead = []
+            for client in list(ACTION_CLIENTS):
+                # do not echo back to sender
+                if client is websocket:
+                    continue
+                try:
+                    await client.send(message)
+                except Exception as e:
+                    print(f"[ACTION_SERVER] Error sending to {getattr(client, 'remote_address', '?')}: {e}")
+                    dead.append(client)
+
+            for d in dead:
+                ACTION_CLIENTS.discard(d)
+    except Exception as e:
+        print(f"[ACTION_SERVER] Handler error: {e}")
+    finally:
+        print(f"[ACTION_SERVER] Client disconnected: {websocket.remote_address}")
+        ACTION_CLIENTS.discard(websocket)
+
+
+async def run_action_server():
+    async with websockets.serve(
+        action_ws_handler,
+        ACTION_SERVER_HOST,
+        ACTION_SERVER_PORT,
+    ):
+        print(f"[ACTION_SERVER] listening on ws://localhost:{ACTION_SERVER_PORT}")
+        await asyncio.Future()
+
+
+def start_action_server_thread():
+    def runner():
+        asyncio.run(run_action_server())
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+
+
+# ------------- background worker for clustering and resolution -------------
 
 def background_worker():
-    """
-    Periodically:
-      - try to form new markets from orphans
-      - ask Grok if any markets are resolved
-    """
     while True:
         try:
             engine.maybe_cluster_orphans()
@@ -33,6 +91,8 @@ def background_worker():
             print("[background_worker] error:", repr(e))
         time.sleep(30.0)
 
+
+# ------------- HTTP routes -------------
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -45,17 +105,10 @@ def health():
             "log_file": LOG_FILE,
         }
     )
+
+
 @app.route("/ingest", methods=["POST"])
 def ingest_manual():
-    """
-    Accept JSON:
-      either a list of tweets
-      or {"tweets": [ ... ]}
-
-    Each tweet can provide:
-      id (optional), text, created_at, followers, verified,
-      likes, retweets, replies, quotes
-    """
     try:
         data = request.get_json(force=True, silent=False)
     except Exception as e:
@@ -88,19 +141,15 @@ def ingest_manual():
             engine.ingest_tweet(tweet, source="manual")
             ingested += 1
     except Exception as e:
-        # this is the part that was causing a 500
-        # log to stdout so you see a traceback in the engine terminal
         import traceback
         print("ERROR during ingest_manual:\n", traceback.format_exc())
         return jsonify({"error": "ingest_failed", "detail": str(e)}), 500
 
     return jsonify({"ingested": ingested})
+
+
 @app.route("/cluster_now", methods=["POST"])
 def cluster_now():
-    """
-    Force a clustering and resolution check right now.
-    Returns current markets and buffer size.
-    """
     try:
         engine.maybe_cluster_orphans()
         engine.maybe_check_resolutions()
@@ -118,10 +167,20 @@ def cluster_now():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/test_grok", methods=["GET"])
+def test_grok():
+    system_prompt = "You are a test bot that replies briefly."
+    user_prompt = "Say hello in one short sentence."
+
+    content = engine._grok_chat(system_prompt, user_prompt, max_tokens=32)
+    return jsonify({"result": content})
+
 
 def main():
     t = threading.Thread(target=background_worker, daemon=True)
     t.start()
+
+    start_action_server_thread()
 
     print("Engine service on http://localhost:8000")
     app.run(host="0.0.0.0", port=8000, threaded=True)
@@ -129,4 +188,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

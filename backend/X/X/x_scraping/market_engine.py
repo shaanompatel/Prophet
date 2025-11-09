@@ -9,22 +9,48 @@ import threading
 from collections import deque, Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from dotenv import load_dotenv
-
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from sklearn.cluster import KMeans
 import requests
 
+import asyncio
+import websockets
 
+
+# load envs
 load_dotenv("bearerkey.env")
-load_dotenv("xAIAPIKEY.env")
-LOG_FILE = os.path.join(os.path.dirname(__file__), "..", "markets.log")
-TWEET_LOG_FILE = os.path.join(os.path.dirname(__file__), "..", "tweets.log")
+load_dotenv("xAIAPIKey.env")
 
+X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN")
+XAI_API_KEY = os.getenv("XAI_API_KEY")
+
+# log files
+BASE_DIR = os.path.dirname(__file__)
+LOG_FILE = os.path.join(BASE_DIR, "..", "markets.log")
+TWEET_LOG_FILE = os.path.join(BASE_DIR, "..", "tweets.log")
+
+# clear logs on import (so each run starts fresh)
+for path in (LOG_FILE, TWEET_LOG_FILE):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8"):
+            pass
+    except Exception:
+        # if this fails we just skip clearing
+        pass
+
+# logging config for markets.log
+logging.basicConfig(
+    filename=LOG_FILE,
+    filemode="w",  # overwrite on start
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 
 # sampled stream buffer window
 BUFFER_WINDOW_MINUTES = 60
@@ -39,16 +65,11 @@ MIN_MARKET_TWEETS_FOR_RESOLUTION_CHECK = 15
 RESOLUTION_CHECK_EVERY_MINUTES = 10
 
 # xAI
-XAI_API_KEY = os.getenv("XAI_API_KEY")
 XAI_CHAT_URL = "https://api.x.ai/v1/chat/completions"
-XAI_MODEL_NAME = "grok-4-fast"  # latest cheap reasoning model
+XAI_MODEL_NAME = "grok-4-fast"  # Grok 4 Fast
 
-
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+# websocket action server
+ACTION_SERVER_URI = os.getenv("ACTION_SERVER_URI", "ws://localhost:8766")
 
 
 @dataclass
@@ -83,6 +104,7 @@ class Market:
     last_resolution_check: Optional[datetime] = None
     grok_reason_resolution: Optional[str] = None
     grok_reason_status: Optional[str] = None
+    grok_reason_probability: Optional[str] = None
 
     def add_tweet(self, rec: TweetRecord):
         # weighted centroid update
@@ -99,7 +121,7 @@ class Market:
 class MarketEngine:
     def __init__(self):
         self.lock = threading.Lock()
-        self.buffer = deque()
+        self.buffer: deque[TweetRecord] = deque()
         self.markets: List[Market] = []
         self.next_market_id = 0
         self.embedder = SentenceTransformer("all-MiniLM-L6-v2")
@@ -127,7 +149,7 @@ class MarketEngine:
 
         rec = TweetRecord(
             id=str(tweet["id"]),
-            text=text,  # <- use the local variable `text`, not rec.text
+            text=text,
             created_at=created,
             user_id=str(tweet.get("user_id", "")),
             followers=int(tweet.get("followers", 0)),
@@ -146,8 +168,6 @@ class MarketEngine:
             self.buffer.append(rec)
             # log after assignment so assigned_market_id is filled if any
             self._log_tweet(rec, source=source)
-
-
 
     def _drop_old_locked(self):
         now = datetime.now(timezone.utc)
@@ -225,7 +245,7 @@ class MarketEngine:
             for label, rec, w in zip(labels, orphans, weights):
                 clusters.setdefault(label, []).append((rec, w))
 
-            for label, items in clusters.items():
+            for _, items in clusters.items():
                 recs = [r for (r, _) in items]
                 total_w = sum(w for (_, w) in items)
                 if len(items) < MIN_CLUSTER_POINTS or total_w < MIN_CLUSTER_TOTAL_WEIGHT:
@@ -240,6 +260,15 @@ class MarketEngine:
 
         label_text = self._label_from_cluster(recs)
 
+        # filter spammy or fully past clusters
+        if not self._cluster_is_suitable_for_market(recs):
+            logging.info(
+                "SKIP_MARKET_UNSUITABLE id=%s rough_label=%r",
+                self.next_market_id,
+                label_text,
+            )
+            return
+
         m = Market(
             id=self.next_market_id,
             label=label_text,
@@ -252,25 +281,45 @@ class MarketEngine:
             m.add_tweet(r)
             r.assigned_market_id = m.id
 
-        # ask Grok for a better question style title
+        # question style title from Grok
         grok_title = self._ask_grok_for_market_title(m, recs)
         if grok_title:
             m.label = grok_title
 
-        # ask Grok for a resolution time
-        resolution_time, reason = self._ask_grok_for_resolution(m, recs)
+        # resolution time from Grok, not in the past
+        resolution_time, reason_for_resolution_time = self._ask_grok_for_resolution(m, recs)
         m.resolution_time = resolution_time
-        m.grok_reason_resolution = reason
+        m.grok_reason_resolution = reason_for_resolution_time
+
+        # initial probability from Grok
+        prob, prob_reason = self._ask_grok_for_initial_probability(m, recs)
+        if prob is None:
+            prob = 0.5
+            prob_reason = prob_reason or "Fallback neutral prior."
+        m.grok_reason_probability = prob_reason
 
         self.markets.append(m)
 
         logging.info(
-            "NEW_MARKET id=%s label=%r resolution=%s reason=%s",
+            "NEW_MARKET id=%s label=%r resolution=%s prob=%.3f res_reason=%s prob_reason=%s",
             m.id,
             m.label,
             m.resolution_time.isoformat() if m.resolution_time else None,
-            (reason or "")[:200],
+            prob,
+            (reason_for_resolution_time or "")[:200],
+            (prob_reason or "")[:200],
         )
+
+        # emit CREATE action in the same shape as the old Gemini agent
+        create_action = {
+            "action": "CREATE",
+            "market_name": m.label,
+            "probability": float(prob),
+            "reason": prob_reason or "Cluster passed thresholds to become a market.",
+            "market_id": m.id,
+            "resolution_time": m.resolution_time.isoformat() if m.resolution_time else None,
+        }
+        self._emit_action(create_action)
 
     def _log_tweet(self, rec: TweetRecord, source: str = "unknown"):
         """
@@ -297,6 +346,108 @@ class MarketEngine:
         except Exception as e:
             logging.warning("Failed to write tweet log: %r", e)
 
+    # ------------- action emission over websocket -------------
+
+    def _emit_action(self, action: dict) -> None:
+        """
+        Fire and forget send of a single action JSON to the Action server.
+
+        Matches the old Gemini decide_markets output shape:
+          CREATE: {"action": "CREATE", "market_name": str, "probability": float, "reason": str}
+          RESOLVE: {"action": "RESOLVE", "market_name": str, "outcome": "YES|NO", "reason": str}
+        """
+        try:
+            asyncio.run(self._send_action_once(action))
+        except RuntimeError:
+            # if there is already an event loop you could swap to a queue here
+            logging.warning(
+                "Could not run asyncio loop for action send; skipping",
+                exc_info=True,
+            )
+        except Exception:
+            logging.warning(
+                "Unexpected error while trying to emit action; skipping",
+                exc_info=True,
+            )
+
+    async def _send_action_once(self, action: dict) -> None:
+        try:
+            async with websockets.connect(ACTION_SERVER_URI) as ws:
+                msg = json.dumps(action, ensure_ascii=False)
+                await ws.send(msg)
+        except Exception as e:
+            logging.warning("Failed to send action over websocket: %r", e)
+
+    # ------------- Grok low level helper -------------
+
+    def _grok_chat(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int = 256,
+        temperature: float = 0.2,
+    ) -> Optional[str]:
+        """
+        Call Grok 4 Fast with a system and user prompt.
+        Returns the content string of the first choice, or None on error.
+        """
+        if not XAI_API_KEY:
+            logging.warning("No XAI_API_KEY set, skipping Grok call")
+            return None
+
+        payload = {
+            "model": XAI_MODEL_NAME,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+
+        try:
+            resp = requests.post(
+                XAI_CHAT_URL,
+                headers={
+                    "Authorization": f"Bearer {XAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                logging.warning(
+                    "Grok chat HTTP %s body=%r",
+                    resp.status_code,
+                    resp.text[:400],
+                )
+                resp.raise_for_status()
+        except requests.RequestException as e:
+            body = ""
+            if hasattr(e, "response") and e.response is not None:
+                body = e.response.text[:400]
+            logging.warning("Grok chat HTTP error: %r body=%r", e, body)
+            return None
+
+        try:
+            data = resp.json()
+            choices = data.get("choices") or []
+            if not choices:
+                logging.warning("Grok chat response has no choices: %r", data)
+                return None
+            message = choices[0].get("message") or {}
+            content = message.get("content")
+            if not content:
+                logging.warning("Grok chat first choice has no content: %r", message)
+                return None
+            return content
+        except Exception as e:
+            logging.warning(
+                "Failed to parse Grok chat response: %r text=%r",
+                e,
+                resp.text[:400],
+            )
+            return None
 
     @staticmethod
     def _label_from_cluster(recs: List[TweetRecord]) -> str:
@@ -318,10 +469,67 @@ class MarketEngine:
         return "misc topic"
 
     # ------------- Grok helpers -------------
+
+    def _cluster_is_suitable_for_market(
+        self,
+        recs: List[TweetRecord],
+    ) -> bool:
+        """
+        Use Grok to decide if this cluster is suitable for a public prediction market.
+
+        Reject markets that are mostly:
+          - product or brand advertising, promotions, giveaways, referral codes
+          - explicit sexual content, pornography, adult services
+          - any event that clearly already happened and is only being recapped
+        """
+        if not XAI_API_KEY:
+            return True
+
+        examples = []
+        for r in recs[:8]:
+            examples.append(f"- {r.text[:240]}")
+        examples_text = "\n".join(examples) if examples else "- (no examples)"
+
+        system_prompt = (
+            "You classify whether a group of social media posts is suitable for a "
+            "public prediction market.\n\n"
+            "Reject the cluster as a market if the posts are mostly any of these:\n"
+            "  - advertising, promotions, brand marketing, referral or discount codes\n"
+            "  - spammy giveaways, contests to like or follow accounts\n"
+            "  - explicit sexual content, pornography, escort or adult services\n"
+            "  - OnlyFans style promotion or similar adult creator promotion\n"
+            "  - discussion that is mainly about events that have already clearly "
+            "    happened in the past, where people are just recapping, reacting, "
+            "    or celebrating, with no future outcome to be decided\n\n"
+            "If the posts mainly describe future or uncertain outcomes they can be "
+            "suitable. If the main thing being talked about has already fully "
+            "happened you must reject the cluster.\n\n"
+            "Answer with a single word:\n"
+            "  ACCEPT - if these posts are suitable for a public prediction market\n"
+            "  REJECT - if they are mostly ads, spam, explicit adult content, or only "
+            "           about past events with no remaining uncertainty.\n"
+        )
+
+        user_prompt = (
+            "Here are example posts from one cluster:\n"
+            f"{examples_text}\n\n"
+            "Decide if this cluster is suitable for a public prediction market.\n"
+            "Answer ONLY with ACCEPT or REJECT."
+        )
+
+        content = self._grok_chat(system_prompt, user_prompt, max_tokens=8)
+        if not content:
+            return True
+
+        decision = content.strip().upper()
+        if "REJECT" in decision:
+            return False
+        return True
+
     def _ask_grok_for_market_title(
         self,
-        market: "Market",
-        recs: List["TweetRecord"],
+        market: Market,
+        recs: List[TweetRecord],
     ) -> Optional[str]:
         """
         Use Grok to generate a short binary prediction market question
@@ -330,7 +538,6 @@ class MarketEngine:
         if not XAI_API_KEY:
             return None
 
-        # take some representative tweets, assume recs are already for this cluster
         examples = []
         for r in recs[:6]:
             examples.append(f"- {r.text[:240]}")
@@ -341,6 +548,9 @@ class MarketEngine:
             "based on social media posts.\n"
             "Given example posts that describe the same real world event, "
             "write a short YES or NO question for a prediction market.\n\n"
+            "Assume that any clusters that are mostly explicit adult content, "
+            "advertising, or pure past event recap have already been rejected, "
+            "so you only receive suitable topics here.\n\n"
             "Guidelines:\n"
             "  - Make it specific and answerable.\n"
             "  - Add a time bound if the posts strongly imply one "
@@ -361,7 +571,6 @@ class MarketEngine:
         )
 
         try:
-            # reuse your existing Grok chat helper
             content = self._grok_chat(system_prompt, user_prompt, max_tokens=64)
             if not content:
                 return None
@@ -373,12 +582,92 @@ class MarketEngine:
             logging.warning("Grok title generation failed: %r", e)
             return None
 
+    def _ask_grok_for_initial_probability(
+        self,
+        market: Market,
+        recs: List[TweetRecord],
+    ) -> Tuple[Optional[float], Optional[str]]:
+        """
+        Ask Grok for a rough initial YES probability for this market.
+
+        Returns (probability between 0 and 1 or None, reason string).
+        """
+        if not XAI_API_KEY:
+            return None, "No XAI_API_KEY available"
+
+        sample_recs = sorted(recs, key=lambda r: -r.weight)[:6]
+        examples = "\n".join(
+            f"- {r.text[:220]}"
+            for r in sample_recs
+        )
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        prompt = f"""
+You estimate a rough prior probability for a binary prediction market.
+
+Market question: {market.label}
+Current time (UTC): {now_iso}
+
+Example posts that motivated this market:
+{examples}
+
+Return a JSON object with:
+{{
+  "probability": float between 0 and 1 for the YES outcome,
+  "reason": "short explanation"
+}}
+""".strip()
+
+        try:
+            headers = {
+                "Authorization": f"Bearer {XAI_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            body = {
+                "model": XAI_MODEL_NAME,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are a precise assistant that outputs only valid JSON.",
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    },
+                ],
+                "stream": False,
+            }
+            resp = requests.post(
+                XAI_CHAT_URL,
+                headers=headers,
+                json=body,
+                timeout=60,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            obj = json.loads(content)
+            prob = obj.get("probability")
+            reason = obj.get("reason", "")
+
+            try:
+                if prob is None:
+                    return None, reason or "Grok did not provide a probability."
+                prob = float(prob)
+                if not (0.0 <= prob <= 1.0):
+                    return None, reason or "Grok probability out of range."
+                return prob, reason
+            except Exception:
+                return None, reason or "Grok probability could not be parsed."
+        except Exception as e:
+            logging.warning("Grok probability error for market %s: %r", market.id, e)
+            return None, f"error: {e!r}"
 
     def _ask_grok_for_resolution(
         self,
         market: Market,
         recs: List[TweetRecord],
-    ):
+    ) -> Tuple[Optional[datetime], str]:
         if not XAI_API_KEY:
             return None, "No XAI_API_KEY available"
 
@@ -387,7 +676,8 @@ class MarketEngine:
             f"- {r.text[:200]}"
             for r in sample_recs
         )
-        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        now = datetime.now(timezone.utc)
+        now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         prompt = f"""
 You are helping design prediction markets from social media chatter.
@@ -400,9 +690,12 @@ Example posts:
 Current time (UTC): {now_iso}
 
 Choose a reasonable resolution time for a binary prediction market about this event.
-If there is a clear scheduled time, pick that.
-If it is phrased as "by some date", use that date at 23:59:59 UTC.
-If there is not enough info, respond with UNKNOWN.
+
+Rules:
+- If there is a clear scheduled time pick that.
+- If the event is phrased as "by some date" use that date at 23:59:59 UTC.
+- Never choose a resolution time in the past relative to the current time.
+- If all plausible dates are in the past or timing is unclear respond with UNKNOWN.
 
 Answer as strict JSON:
 {{
@@ -440,7 +733,6 @@ Answer as strict JSON:
             resp.raise_for_status()
             data = resp.json()
             content = data["choices"][0]["message"]["content"]
-            # try to parse JSON from content
             obj = json.loads(content)
             iso_dt = obj.get("iso_datetime")
             reason = obj.get("reason", "")
@@ -448,8 +740,11 @@ Answer as strict JSON:
                 dt = datetime.fromisoformat(
                     iso_dt.replace("Z", "+00:00")
                 ).astimezone(timezone.utc)
+                # do not allow deadlines in the past
+                if dt < now:
+                    return None, reason or "Grok suggested a past datetime, treating as unknown."
                 return dt, reason
-            return None, reason or "Grok returned no datetime"
+            return None, reason or "Grok returned no datetime."
         except Exception as e:
             logging.warning("Grok resolution error for market %s: %r", market.id, e)
             return None, f"error: {e!r}"
@@ -458,7 +753,7 @@ Answer as strict JSON:
         self,
         market: Market,
         recs: List[TweetRecord],
-    ):
+    ) -> Tuple[str, str]:
         if not XAI_API_KEY:
             return "open", "No XAI_API_KEY available"
 
@@ -489,7 +784,7 @@ Answer as JSON with one of three statuses:
 
 - "open": event outcome is not clear yet
 - "yes": event clearly happened as the market expected
-- "no": event clearly did not happen, or was cancelled
+- "no": event clearly did not happen or was cancelled
 
 Return strict JSON:
 {{
@@ -545,20 +840,27 @@ Return strict JSON:
                 if m.status != "open":
                     continue
 
-                if m.last_resolution_check and (
-                    now - m.last_resolution_check
-                    < timedelta(minutes=RESOLUTION_CHECK_EVERY_MINUTES)
-                ):
-                    continue
-
                 # gather tweets for this market
                 recs = [r for r in self.buffer if r.assigned_market_id == m.id]
-                if len(recs) < MIN_MARKET_TWEETS_FOR_RESOLUTION_CHECK:
+                if not recs:
                     continue
 
-                # simple rule: only check after planned resolution time, if we have one
-                if m.resolution_time and now < m.resolution_time:
-                    continue
+                is_past_deadline = (
+                    m.resolution_time is not None and now >= m.resolution_time
+                )
+
+                if not is_past_deadline:
+                    if m.last_resolution_check and (
+                        now - m.last_resolution_check
+                        < timedelta(minutes=RESOLUTION_CHECK_EVERY_MINUTES)
+                    ):
+                        continue
+
+                    if len(recs) < MIN_MARKET_TWEETS_FOR_RESOLUTION_CHECK:
+                        continue
+
+                    if m.resolution_time and now < m.resolution_time:
+                        continue
 
                 m.last_resolution_check = now
                 status, reason = self._ask_grok_if_resolved(m, recs)
@@ -572,6 +874,15 @@ Return strict JSON:
                         m.label,
                         (reason or "")[:200],
                     )
+                    resolve_action = {
+                        "action": "RESOLVE",
+                        "market_name": m.label,
+                        "outcome": "YES",
+                        "reason": reason or "Grok judged this event happened as expected.",
+                        "market_id": m.id,
+                    }
+                    self._emit_action(resolve_action)
+
                 elif status == "no":
                     m.status = "resolved_no"
                     logging.info(
@@ -580,7 +891,15 @@ Return strict JSON:
                         m.label,
                         (reason or "")[:200],
                     )
-                # if open, nothing to log
+                    resolve_action = {
+                        "action": "RESOLVE",
+                        "market_name": m.label,
+                        "outcome": "NO",
+                        "reason": reason or "Grok judged this event did not happen.",
+                        "market_id": m.id,
+                    }
+                    self._emit_action(resolve_action)
+                # if status is "open", nothing to log or emit
 
     # ------------- utilities for debug -------------
 
@@ -604,3 +923,36 @@ Return strict JSON:
                     for m in self.markets
                 ],
             }
+
+
+# ------------- standalone websocket test -------------
+
+async def _test_action_server():
+    """
+    Connects to the websocket action server and sends a test action.
+
+    Run with:
+        python market_engine.py
+
+    You should see this action printed by sample_market_listener.py if the
+    server and listener are wired correctly.
+    """
+    print(f"[test] connecting to action server at {ACTION_SERVER_URI}...")
+    async with websockets.connect(ACTION_SERVER_URI) as ws:
+        action = {
+            "action": "TEST",
+            "message": "market_engine websocket self test",
+            "time": datetime.now(timezone.utc).isoformat(),
+        }
+        msg = json.dumps(action, ensure_ascii=False)
+        print(f"[test] sending test action: {msg}")
+        await ws.send(msg)
+        print("[test] test action sent, closing connection.")
+
+
+if __name__ == "__main__":
+    # simple websocket connectivity test
+    try:
+        asyncio.run(_test_action_server())
+    except Exception as e:
+        print("[test] websocket test failed:", repr(e))
