@@ -305,85 +305,85 @@ async def listen_to_tweets(ws_exchange, ai_model):
         
         await asyncio.sleep(5)
 
-async def process_ai_trade(ws_exchange, action: dict, available_usd: float, available_tokens: dict) -> (float, str, float):
+# --- REBUILT: _process_ai_trade for AMM (with Percentage Caps) ---
+async def _process_ai_trade(self, action: dict, available_usd: float, available_tokens: dict) -> (float, str, float):
     """
-    Calculates quantity from percentage and sends order.
+    Calculates quantity from percentage and sends AMM trade order,
+    but caps the trade to a maximum size to prevent price collapse.
     Returns (usd_spent, token_market, tokens_sold) to earmark funds.
     """
     
+    # --- NEW: Define maximums for a single trade ---
+    # This is the "sanity check" to prevent market collapse.
+    MAX_USD_PER_TRADE = 500.0   # Cap any single BUY at $500
+    MAX_TOKENS_PER_TRADE = 500.0 # Cap any single SELL at 500 tokens
+    
+    # --- 1. Get All AI Parameters ---
     side = action.get("side")
-    market = action.get("market_name")
+    market_asset = action.get("market_asset") # e.g., "Market_YES"
     trade_size_pct = action.get("trade_size_pct", 0.1) # Default to 10%
     
-    print(f"--- [{AGENT_ID}] AI ACTION: {side} {market} ({trade_size_pct*100}%) ---")
-    print(f"    Reason: {action.get('reason')}")
+    print(f"--- [{self.agent_id}] AI ACTION: {side} {market_asset} ({trade_size_pct*100}%) ---")
+    print(f"     Reason: {action.get('reason')}")
 
+    current_price = self.active_markets.get(market_asset, {}).get('price')
+    if current_price is None:
+        print(f"     ACTION FAILED: No price data for {market_asset}.")
+        return (0, None, 0)
+
+    # --- 2. Process BUY Logic (with new cap) ---
     if side == "BUY":
-        price_to_buy = ACTIVE_MARKETS_STATE.get(market, {}).get('best_ask')
+        # 1. Calculate desired spend based on AI confidence
+        desired_usd_to_spend = available_usd * trade_size_pct
         
-        if not price_to_buy:
-            print(f"    ACTION FAILED: No 'best_ask' price for {market}. Cannot buy.")
-            return (0, None, 0) # (usd_spent, token_market, tokens_sold)
+        # 2. Apply the hard cap
+        usd_to_spend = min(desired_usd_to_spend, MAX_USD_PER_TRADE)
+        
+        if usd_to_spend < 1.0: # Don't trade if less than $1
+            print(f"     ACTION FAILED: Trade size too small (${usd_to_spend:.2f}).")
+            return (0, None, 0)
             
-        # Calculate quantity based on *batch* liquid money
-        usd_to_spend = available_usd * trade_size_pct
-        
-        if price_to_buy == 0:
-             print(f"    ACTION FAILED: Price is 0. Cannot calculate quantity.")
-             return (0, None, 0)
-             
-        quantity_to_buy = round(usd_to_spend / price_to_buy, 3) 
+        if current_price <= 0:
+            print(f"     ACTION FAILED: Market price is {current_price}. Cannot calculate quantity.")
+            return (0, None, 0)
+
+        # 3. Calculate quantity based on the *capped* amount
+        quantity_to_buy = round(usd_to_spend / current_price, 3) 
 
         if quantity_to_buy < 0.001:
-            print(f"    ACTION FAILED: Trade size too small (Qty: {quantity_to_buy}).")
-            return (0, None, 0)
-
-        # Check against available (earmarked) USD
-        actual_cost = quantity_to_buy * price_to_buy
-        if available_usd < actual_cost:
-            print(f"    ACTION FAILED: Insufficient *batch* USD. Need ${actual_cost:.2f}, have ${available_usd:.2f}")
+            print(f"     ACTION FAILED: Calculated quantity too small (Qty: {quantity_to_buy}).")
             return (0, None, 0)
             
-        await ws_exchange.send(json.dumps({
-            "action": "place_order",
-            "market": market,
-            "side": "buy",
-            "price": price_to_buy, 
-            "quantity": quantity_to_buy
+        await self.ws_exchange.send(json.dumps({
+            "action": "trade",
+            "market": market_asset,
+            "quantity": quantity_to_buy  # Positive for BUY
         }))
-        print(f"    > Sent BUY order for {quantity_to_buy} {market} @ ${price_to_buy}")
-        # Return the USD amount we just spent
-        return (actual_cost, None, 0)
+        print(f"     > Sent BUY for {quantity_to_buy} {market_asset}. (Capped spend at ${usd_to_spend:.2f})")
+        return (usd_to_spend, None, 0) # Earmark the capped amount
 
+    # --- 3. Process SELL Logic (with new cap) ---
     elif side == "SELL":
-        price_to_sell = ACTIVE_MARKETS_STATE.get(market, {}).get('best_bid')
+        available_tokens_for_market = available_tokens.get(market_asset, 0)
         
-        # Check against available (earmarked) tokens
-        available_tokens_for_market = available_tokens.get(market, 0)
+        # 1. Calculate desired sell amount based on AI confidence
+        desired_tokens_to_sell = available_tokens_for_market * trade_size_pct
         
-        if not price_to_sell:
-            print(f"    ACTION FAILED: No 'best_bid' price for {market}. Cannot sell.")
-            return (0, None, 0)
-
-        # Calculate quantity based on token holdings
-        quantity_to_sell = round(available_tokens_for_market * trade_size_pct, 3)
-
+        # 2. Apply the hard cap
+        quantity_to_sell = min(desired_tokens_to_sell, MAX_TOKENS_PER_TRADE)
+        
         if quantity_to_sell < 0.001:
-            print(f"    ACTION FAILED: No tokens to sell ({available_tokens_for_market}) or trade size too small.")
+            print(f"     ACTION FAILED: No tokens to sell ({available_tokens_for_market}) or trade size too small.")
             return (0, None, 0)
         
-        await ws_exchange.send(json.dumps({
-            "action": "place_order",
-            "market": market,
-            "side": "sell",
-            "price": price_to_sell, 
-            "quantity": quantity_to_sell
+        await self.ws_exchange.send(json.dumps({
+            "action": "trade",
+            "market": market_asset,
+            "quantity": -quantity_to_sell # Negative for SELL
         }))
-        print(f"    > Sent SELL order for {quantity_to_sell} {market} @ ${price_to_sell}")
-        # Return the token amount we just sold
-        return (0, market, quantity_to_sell)
+        print(f"     > Sent SELL for {quantity_to_sell} {market_asset}. (Capped at {MAX_TOKENS_PER_TRADE} tokens)")
+        return (0, market_asset, quantity_to_sell) # Earmark the capped tokens
 
-    # Default return if action is not BUY or SELL
     return (0, None, 0)
 
 # --- Main function is unchanged ---
