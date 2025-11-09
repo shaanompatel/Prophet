@@ -69,11 +69,8 @@ echo $! > $PID_DIR/marketmaker.pid
 
 # 4. Start the Exchange
 echo "Starting Exchange..."
-# RUST COMMAND GOES HERE
-(
-  cd ./offchain \
-    && cargo run > ../$LOG_DIR/exchange.log 2>&1
-) &
+# Added -u flag to python command
+python -u ./backend/Exchange/exchange_pool.py > $LOG_DIR/exchange_pool.log 2>&1 &
 echo $! > $PID_DIR/exchange.pid
 
 # 5. Start the Agent Manager

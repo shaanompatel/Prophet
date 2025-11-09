@@ -1,71 +1,795 @@
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Live Exchange Dashboard</title>
-    <link rel="stylesheet" href="style.css">
+    <title>EXCHANGE TERMINAL</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Courier New', monospace;
+            background: #0a0e1a;
+            color: #00ff41;
+            overflow: hidden;
+            height: 100vh;
+        }
+        .terminal-header {
+            background: linear-gradient(90deg, #1a1f2e 0%, #0f1419 100%);
+            padding: 12px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 2px solid #00ff41;
+            box-shadow: 0 2px 10px rgba(0,255,65,0.3);
+        }
+        .logo { font-size: 22px; font-weight: bold; color: #00ff41; letter-spacing: 3px; }
+        .status-bar { display: flex; gap: 25px; font-size: 13px; }
+        .status-item { display: flex; align-items: center; gap: 8px; }
+        .status-dot {
+            width: 10px; height: 10px; border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+        .status-connected { background: #00ff41; }
+        .status-disconnected { background: #ff0040; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+        
+        .tabs {
+            display: flex;
+            background: #0f1419;
+            border-bottom: 1px solid #00ff41;
+        }
+        .tab {
+            padding: 12px 30px;
+            cursor: pointer;
+            border-right: 1px solid #1a1f2e;
+            transition: all 0.2s;
+            font-size: 13px;
+            letter-spacing: 1.5px;
+        }
+        .tab:hover { background: #1a1f2e; }
+        .tab.active { background: #00ff41; color: #0a0e1a; font-weight: bold; }
+        
+        .tab-content { display: none; height: calc(100vh - 105px); overflow-y: auto; }
+        .tab-content.active { display: block; }
+        
+        .grid-layout { 
+            display: grid; 
+            grid-template-columns: 2fr 1fr; 
+            gap: 12px; 
+            padding: 12px; 
+            height: 100%;
+        }
+        .grid-3col { 
+            display: grid; 
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); 
+            gap: 12px; 
+            padding: 12px;
+        }
+        
+        .panel {
+            background: rgba(15, 20, 25, 0.8);
+            border: 1px solid #00ff41;
+            padding: 15px;
+            position: relative;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+        .panel::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            height: 2px;
+            background: linear-gradient(90deg, transparent, #00ff41, transparent);
+            animation: scan 3s linear infinite;
+        }
+        @keyframes scan { 0% { transform: translateX(-100%); } 100% { transform: translateX(100%); } }
+        
+        .panel-title {
+            font-size: 13px;
+            color: #00ff41;
+            margin-bottom: 12px;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            border-bottom: 1px solid #1a1f2e;
+            padding-bottom: 8px;
+        }
+        
+        .panel-content {
+            flex: 1;
+            overflow-y: auto;
+        }
+        
+        .market-item {
+            background: rgba(26, 31, 46, 0.5);
+            padding: 10px 12px;
+            margin: 6px 0;
+            border-left: 3px solid #00ff41;
+            font-size: 13px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: all 0.2s;
+            cursor: pointer;
+        }
+        .market-item:hover { background: rgba(0, 255, 65, 0.1); transform: translateX(5px); }
+        .market-name { color: #fff; font-weight: bold; font-size: 14px; margin-bottom: 4px; }
+        .price-yes { color: #00ff41; }
+        .price-no { color: #ff4757; }
+        
+        .mini-chart {
+            width: 120px;
+            height: 40px;
+            background: rgba(10, 14, 26, 0.5);
+        }
+        
+        .agent-card {
+            background: rgba(26, 31, 46, 0.5);
+            padding: 12px;
+            margin: 6px 0;
+            border: 1px solid #1a1f2e;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .agent-card:hover { border-color: #00ff41; box-shadow: 0 0 10px rgba(0,255,65,0.3); }
+        .agent-name { color: #ffa502; font-weight: bold; margin-bottom: 8px; font-size: 14px; }
+        .holding { display: flex; justify-content: space-between; font-size: 12px; margin: 3px 0; }
+        
+        .chart-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 12px;
+            padding: 12px;
+        }
+        
+        .chart-panel {
+            background: rgba(15, 20, 25, 0.8);
+            border: 1px solid #1a1f2e;
+            padding: 12px;
+            min-height: 200px;
+        }
+        
+        .chart-header {
+            font-size: 12px;
+            color: #00ff41;
+            margin-bottom: 8px;
+            font-weight: bold;
+            text-align: center;
+        }
+        
+        canvas { width: 100% !important; height: 100% !important; }
+        
+        .feed-item {
+            padding: 10px 12px;
+            margin: 4px 0;
+            font-size: 12px;
+            border-left: 3px solid;
+            animation: slideIn 0.3s;
+        }
+        @keyframes slideIn { from { transform: translateX(-100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+        .feed-buy { border-color: #00ff41; background: rgba(0,255,65,0.05); }
+        .feed-sell { border-color: #ff4757; background: rgba(255,71,87,0.05); }
+        .feed-new { border-color: #ffa502; background: rgba(255,165,2,0.05); }
+        
+        .form-group { margin: 12px 0; }
+        .form-group label { display: block; font-size: 12px; margin-bottom: 6px; color: #00ff41; }
+        .form-group input, .form-group select, .form-group textarea {
+            width: 100%;
+            padding: 10px;
+            background: rgba(26, 31, 46, 0.8);
+            border: 1px solid #00ff41;
+            color: #00ff41;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+        }
+        .btn {
+            background: #00ff41;
+            color: #0a0e1a;
+            padding: 12px 24px;
+            border: none;
+            cursor: pointer;
+            font-family: 'Courier New', monospace;
+            font-weight: bold;
+            letter-spacing: 1.5px;
+            transition: all 0.2s;
+            font-size: 13px;
+        }
+        .btn:hover { box-shadow: 0 0 20px rgba(0,255,65,0.5); }
+        
+        .liquidity-bar {
+            height: 35px;
+            background: rgba(26, 31, 46, 0.8);
+            position: relative;
+            margin: 8px 0;
+            border: 1px solid #1a1f2e;
+        }
+        .liquidity-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #00ff41, #00cc33);
+            transition: width 0.5s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 11px;
+            color: #0a0e1a;
+            font-weight: bold;
+        }
+        
+        .detail-modal {
+            display: none;
+            position: fixed;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            width: 85%;
+            max-width: 900px;
+            max-height: 85vh;
+            overflow-y: auto;
+            background: #0a0e1a;
+            border: 2px solid #00ff41;
+            box-shadow: 0 0 50px rgba(0,255,65,0.5);
+            z-index: 1000;
+            padding: 25px;
+        }
+        .detail-modal.active { display: block; }
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.85);
+            z-index: 999;
+        }
+        .modal-overlay.active { display: block; }
+        .close-btn {
+            float: right;
+            cursor: pointer;
+            font-size: 24px;
+            color: #ff4757;
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 12px;
+            margin: 15px 0;
+        }
+        .stat-box {
+            background: rgba(26, 31, 46, 0.5);
+            padding: 15px;
+            text-align: center;
+            border: 1px solid #1a1f2e;
+        }
+        .stat-value { font-size: 24px; color: #00ff41; font-weight: bold; }
+        .stat-label { font-size: 10px; color: #666; text-transform: uppercase; margin-top: 5px; }
+        
+        .trade-list {
+            max-height: 300px;
+            overflow-y: auto;
+            margin-top: 15px;
+        }
+        .trade-item {
+            padding: 8px;
+            margin: 4px 0;
+            font-size: 11px;
+            background: rgba(26, 31, 46, 0.3);
+            border-left: 2px solid;
+        }
+        .trade-buy { border-color: #00ff41; }
+        .trade-sell { border-color: #ff4757; }
+        
+        ::-webkit-scrollbar { width: 10px; }
+        ::-webkit-scrollbar-track { background: #0a0e1a; }
+        ::-webkit-scrollbar-thumb { background: #00ff41; border-radius: 5px; }
+    </style>
 </head>
-
 <body>
-    <header>
-        <h1>Live Exchange Dashboard</h1>
-        <div id="connection-status" class="status-disconnected">
-            CONNECTING...
-        </div>
-    </header>
-
-    <div class="container">
-        <div class="column">
-            <h2>📈 Active Markets</h2>
-            <div id="markets-container">
+    <div class="terminal-header">
+        <div class="logo">◼ PROPHET TERMINAL</div>
+        <div class="status-bar">
+            <div class="status-item">
+                <div class="status-dot" id="status-dot"></div>
+                <span id="status-text">CONNECTING</span>
             </div>
+            <div class="status-item">UPTIME: <span id="uptime">00:00:00</span></div>
+            <div class="status-item">AGENTS: <span id="agent-count">0</span></div>
+            <div class="status-item">MARKETS: <span id="market-count">0</span></div>
         </div>
-
-        <div class="column">
-            <h2>🤖 Agent Holdings</h2>
-            <div id="agents-container">
+    </div>
+    
+    <div class="tabs">
+        <div class="tab active" onclick="switchTab(0)">MARKETS</div>
+        <div class="tab" onclick="switchTab(1)">AGENTS</div>
+        <div class="tab" onclick="switchTab(2)">CHARTS</div>
+        <div class="tab" onclick="switchTab(3)">FEED</div>
+        <div class="tab" onclick="switchTab(4)">SPAWN</div>
+    </div>
+    
+    <div class="tab-content active" id="tab-markets">
+        <div class="grid-layout">
+            <div class="panel">
+                <div class="panel-title">◼ ACTIVE MARKETS</div>
+                <div class="panel-content" id="markets-list"></div>
             </div>
-        </div>
-
-        <div class="column">
-            <h2>Feed</h2>
-            <div id="trade-feed-container">
+            <div class="panel">
+                <div class="panel-title">◼ LIQUIDITY DEPTH</div>
+                <div class="panel-content" id="liquidity-viz"></div>
             </div>
         </div>
     </div>
-
-    <div class="column">
-        <h2>🚀 Spawn New Agent</h2>
-        <form id="spawn-form">
-            <div class="form-group">
-                <label for="agent-name">Agent Name:</label>
-                <input type="text" id="agent-name" value="Trader_Charlie" required>
+    
+    <div class="tab-content" id="tab-agents">
+        <div class="grid-3col">
+            <div class="panel" style="grid-column: 1 / -1;">
+                <div class="panel-title">◼ AGENT PORTFOLIO</div>
+                <div class="panel-content" id="agents-list"></div>
             </div>
-
-            <div class="form-group">
-                <label for="agent-model">OpenRouter Model:</label>
-                <select id="agent-model" required>
-                    <option value="anthropic/claude-3-haiku">Claude 3 Haiku (Anthropic)</option>
-                    <option value="meta-llama/llama-3-8b-instruct">Llama 3 8B Instruct (Meta)</option>
-                    <option value="google/gemini-2.5-flash-lite">Gemini 2.5 Flash Lite (Google)</option>
-                </select>
-            </div>
-
-            <div class="form-group">
-                <label for="agent-strategy">Strategy Prompt:</label>
-                <textarea id="agent-strategy" rows="6" required>
-You are a very cautious, long-term trader. You only buy assets you believe are severely underpriced (prob > 0.3 from market) and hold them.
-            </textarea>
-            </div>
-
-            <button type="submit" id="spawn-button">Spawn Agent</button>
-        </form>
-        <div id="spawn-status"></div>
+        </div>
     </div>
+    
+    <div class="tab-content" id="tab-charts">
+        <div class="chart-grid" id="charts-container"></div>
+    </div>
+    
+    <div class="tab-content" id="tab-feed">
+        <div class="grid-layout">
+            <div class="panel">
+                <div class="panel-title">◼ LIVE FEED</div>
+                <div class="panel-content" id="live-feed"></div>
+            </div>
+            <div class="panel">
+                <div class="panel-title">◼ MARKET STATISTICS</div>
+                <div class="panel-content">
+                    <div class="stats-grid" id="stats-grid"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="tab-content" id="tab-spawn">
+        <div class="grid-layout">
+            <div class="panel">
+                <div class="panel-title">◼ DEPLOY NEW AGENT</div>
+                <div class="panel-content">
+                    <form id="spawn-form">
+                        <div class="form-group">
+                            <label>AGENT_ID:</label>
+                            <input type="text" id="agent-name" value="Trader_Delta">
+                        </div>
+                        <div class="form-group">
+                            <label>MODEL:</label>
+                            <select id="agent-model">
+                                <option value="anthropic/claude-3-haiku">Claude 3 Haiku</option>
+                                <option value="meta-llama/llama-3-8b-instruct">Llama 3 8B</option>
+                                <option value="google/gemini-2.5-flash-lite">Gemini 2.5 Flash</option>
+                                <option value="ibm-granite/granite-4.0-h-micro">IBM Granite 4.0 H Micro</option>
+                                <option value="nvidia/llama-3.3-nemotron-super-49b-v1.5">NVIDIA LLama Nemotron Super</option>
+                                <option value="deepseek/deepseek-v3.2-exp">DeepSeek-v3.2-Exp</option>
+                                <option value="x-ai/grok-4-fast">Grok 4 Fast</option>
+                                <option value="nousresearch/hermes-4-70b">NousResearch Hermes 4 70B</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>STRATEGY:</label>
+                            <textarea id="agent-strategy" rows="8">You are a momentum trader. Buy rising assets, sell falling ones. React quickly to price movements.</textarea>
+                        </div>
+                        <button type="submit" class="btn">► DEPLOY</button>
+                    </form>
+                    <div id="spawn-status" style="margin-top: 15px; font-size: 12px;"></div>
+                </div>
+            </div>
+            <div class="panel">
+                <div class="panel-title">◼ DEPLOYMENT LOG</div>
+                <div class="panel-content" id="deploy-log"></div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="modal-overlay" id="modal-overlay" onclick="closeModal()"></div>
+    <div class="detail-modal" id="detail-modal">
+        <span class="close-btn" onclick="closeModal()">✕</span>
+        <div id="modal-content"></div>
+    </div>
+    
+    <script>
+        const wsUrl = "ws://localhost:8767";
+        let socket, currentTab = 0;
+        let markets = {}, agents = {}, trades = [], priceHistory = {};
+        let startTime = Date.now();
+        let chartCanvases = {};
+        
+        function switchTab(idx) {
+            document.querySelectorAll('.tab').forEach((t, i) => {
+                t.classList.toggle('active', i === idx);
+            });
+            document.querySelectorAll('.tab-content').forEach((c, i) => {
+                c.classList.toggle('active', i === idx);
+            });
+            currentTab = idx;
+            if (idx === 2) renderCharts();
+        }
+        
+        function connect() {
+            socket = new WebSocket(wsUrl);
+            
+            socket.onopen = () => {
+                document.getElementById('status-dot').className = 'status-dot status-connected';
+                document.getElementById('status-text').textContent = 'ONLINE';
+                socket.send(JSON.stringify({action: "register_spectator"}));
+            };
+            
+            socket.onmessage = (e) => {
+                const data = JSON.parse(e.data);
+                switch (data.type) {
+                    case "price_update": handlePriceUpdate(data); break;
+                    case "account_update": handleAccountUpdate(data); break;
+                    case "trade_executed": handleTrade(data); break;
+                    case "new_market": handleNewMarket(data); break;
+                    case "market_resolved": handleResolve(data); break;
+                    case "error": console.error(data.message); break;
+                }
+            };
+            
+            socket.onclose = () => {
+                document.getElementById('status-dot').className = 'status-dot status-disconnected';
+                document.getElementById('status-text').textContent = 'OFFLINE';
+                setTimeout(connect, 3000);
+            };
+        }
+        
+        function handlePriceUpdate(d) {
+            markets[d.market] = d;
+            if (!priceHistory[d.market]) priceHistory[d.market] = [];
+            priceHistory[d.market].push({time: Date.now(), price: d.price_yes});
+            if (priceHistory[d.market].length > 100) priceHistory[d.market].shift();
+            renderMarkets();
+            renderLiquidity();
+            updateStats();
+            if (currentTab === 2) renderCharts();
+        }
+        
+        function handleAccountUpdate(d) {
+            if (d.agent_id && !d.agent_id.startsWith('spectator')) {
+                agents[d.agent_id] = d;
+                renderAgents();
+            }
+        }
+        
+        function handleTrade(d) {
+            trades.unshift(d);
+            if (trades.length > 200) trades.pop();
+            addToFeed(d.quantity > 0 ? 'BUY' : 'SELL', `${d.agent} ${d.quantity > 0 ? 'BOUGHT' : 'SOLD'} ${Math.abs(d.quantity).toFixed(2)} ${d.market} @ $${Math.abs(d.cost).toFixed(2)}`, 'feed-' + (d.quantity > 0 ? 'buy' : 'sell'));
+            updateStats();
+        }
+        
+        function handleNewMarket(d) {
+            addToFeed('NEW', `Market created: ${d.market_name}`, 'feed-new');
+        }
+        
+        function handleResolve(d) {
+            addToFeed('RESOLVE', `${d.market_name} → ${d.outcome}`, 'feed-new');
+            delete markets[d.market_name];
+            delete priceHistory[d.market_name];
+            renderMarkets();
+            if (currentTab === 2) renderCharts();
+        }
+        
+        function renderMarkets() {
+            const html = Object.values(markets).map(m => {
+                const canvasId = `mini-${m.market.replace(/[^a-zA-Z0-9]/g, '_')}`;
+                return `
+                    <div class="market-item" onclick="focusMarket('${m.market}')">
+                        <div style="flex: 1;">
+                            <div class="market-name">${m.market}</div>
+                            <div style="margin-top: 4px;">
+                                <span class="price-yes">Y: $${m.price_yes.toFixed(3)}</span> | 
+                                <span class="price-no">N: $${m.price_no.toFixed(3)}</span>
+                            </div>
+                        </div>
+                        <div style="text-align: right; margin-right: 10px; font-size: 11px; color: #666;">
+                            <div>qY: ${m.q_yes.toFixed(1)}</div>
+                            <div>qN: ${m.q_no.toFixed(1)}</div>
+                        </div>
+                        <canvas id="${canvasId}" class="mini-chart"></canvas>
+                    </div>
+                `;
+            }).join('');
+            document.getElementById('markets-list').innerHTML = html || '<div style="padding: 20px; text-align: center; color: #666;">No markets available</div>';
+            document.getElementById('market-count').textContent = Object.keys(markets).length;
+            
+            // Draw mini charts
+            Object.values(markets).forEach(m => {
+                const canvasId = `mini-${m.market.replace(/[^a-zA-Z0-9]/g, '_')}`;
+                const canvas = document.getElementById(canvasId);
+                if (canvas && priceHistory[m.market]) {
+                    drawMiniChart(canvas, priceHistory[m.market]);
+                }
+            });
+        }
+        
+        function drawMiniChart(canvas, data) {
+            if (!data || data.length < 2) return;
+            const ctx = canvas.getContext('2d');
+            const w = canvas.width = 120;
+            const h = canvas.height = 40;
+            
+            ctx.fillStyle = '#0a0e1a';
+            ctx.fillRect(0, 0, w, h);
+            
+            const minP = Math.min(...data.map(d => d.price));
+            const maxP = Math.max(...data.map(d => d.price));
+            const range = maxP - minP || 1;
+            const step = w / (data.length - 1);
+            
+            ctx.strokeStyle = '#00ff41';
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            data.forEach((d, i) => {
+                const x = i * step;
+                const y = h - ((d.price - minP) / range * h * 0.8 + h * 0.1);
+                i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+            });
+            ctx.stroke();
+        }
+        
+        function renderLiquidity() {
+            const html = Object.values(markets).map(m => {
+                const total = m.q_yes + m.q_no;
+                const pct = total > 0 ? (m.q_yes / total * 100) : 50;
+                return `
+                    <div style="margin: 10px 0;">
+                        <div style="font-size: 12px; margin-bottom: 5px; font-weight: bold;">${m.market}</div>
+                        <div class="liquidity-bar">
+                            <div class="liquidity-fill" style="width: ${pct}%">${pct.toFixed(1)}%</div>
+                        </div>
+                        <div style="font-size: 10px; color: #666; margin-top: 3px; display: flex; justify-content: space-between;">
+                            <span>YES: ${m.q_yes.toFixed(1)}</span>
+                            <span>NO: ${m.q_no.toFixed(1)}</span>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+            document.getElementById('liquidity-viz').innerHTML = html || '<div style="padding: 20px; text-align: center; color: #666;">No liquidity data</div>';
+        }
+        
+        function renderAgents() {
+            const html = Object.entries(agents).map(([id, a]) => {
+                const holdings = Object.entries(a.balances).filter(([k, v]) => v !== 0);
+                if (holdings.length === 0) return '';
+                return `
+                    <div class="agent-card" onclick="showAgentDetail('${id}')">
+                        <div class="agent-name">► ${id}</div>
+                        ${holdings.map(([asset, amt]) => `
+                            <div class="holding">
+                                <span>${asset}</span>
+                                <span style="color: ${amt > 0 ? '#00ff41' : '#ff4757'}">${amt.toFixed(2)}</span>
+                            </div>
+                        `).join('')}
+                    </div>
+                `;
+            }).join('');
+            document.getElementById('agents-list').innerHTML = html || '<div style="padding: 20px; text-align: center; color: #666;">No agents active</div>';
+            document.getElementById('agent-count').textContent = Object.keys(agents).length;
+        }
+        
+        function renderCharts() {
+            const container = document.getElementById('charts-container');
+            const marketKeys = Object.keys(priceHistory);
+            
+            if (marketKeys.length === 0) {
+                container.innerHTML = '<div style="padding: 50px; text-align: center; color: #666;">No market data available</div>';
+                return;
+            }
+            
+            const html = marketKeys.map(market => {
+                const canvasId = `chart-${market.replace(/[^a-zA-Z0-9]/g, '_')}`;
+                return `
+                    <div class="chart-panel">
+                        <div class="chart-header">${market}</div>
+                        <canvas id="${canvasId}" style="height: 150px;"></canvas>
+                    </div>
+                `;
+            }).join('');
+            
+            container.innerHTML = html;
+            
+            marketKeys.forEach(market => {
+                const canvasId = `chart-${market.replace(/[^a-zA-Z0-9]/g, '_')}`;
+                const canvas = document.getElementById(canvasId);
+                if (canvas && priceHistory[market]) {
+                    drawFullChart(canvas, priceHistory[market], market);
+                }
+            });
+        }
+        
+        function drawFullChart(canvas, data, market) {
+            if (!data || data.length < 2) return;
+            const ctx = canvas.getContext('2d');
+            const w = canvas.width = canvas.offsetWidth;
+            const h = canvas.height = 150;
+            
+            ctx.fillStyle = '#0a0e1a';
+            ctx.fillRect(0, 0, w, h);
+            
+            ctx.strokeStyle = '#1a1f2e';
+            ctx.lineWidth = 0.5;
+            for (let i = 0; i < 5; i++) {
+                const y = (h / 4) * i;
+                ctx.beginPath();
+                ctx.moveTo(0, y);
+                ctx.lineTo(w, y);
+                ctx.stroke();
+            }
+            
+            const minP = Math.min(...data.map(d => d.price));
+            const maxP = Math.max(...data.map(d => d.price));
+            const range = maxP - minP || 1;
+            const step = w / (data.length - 1);
+            
+            ctx.strokeStyle = '#00ff41';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            data.forEach((d, i) => {
+                const x = i * step;
+                const y = h - ((d.price - minP) / range * h * 0.85 + h * 0.1);
+                i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+            });
+            ctx.stroke();
+            
+            const lastPrice = data[data.length - 1].price;
+            ctx.fillStyle = '#00ff41';
+            ctx.font = '11px Courier New';
+            ctx.fillText(`$${lastPrice.toFixed(3)}`, w - 60, 15);
+        }
+        
+        function focusMarket(market) {
+            switchTab(2);
+        }
+        
+        function addToFeed(type, msg, cls) {
+            const feed = document.getElementById('live-feed');
+            const item = document.createElement('div');
+            item.className = `feed-item ${cls}`;
+            const timestamp = new Date().toLocaleTimeString();
+            item.innerHTML = `<strong>[${timestamp}]</strong> <strong>[${type}]</strong> ${msg}`;
+            feed.insertBefore(item, feed.firstChild);
+            if (feed.children.length > 150) feed.removeChild(feed.lastChild);
+        }
+        
+        function updateStats() {
+            const totalVol = trades.reduce((sum, t) => sum + Math.abs(t.cost), 0);
+            const buyVol = trades.filter(t => t.quantity > 0).length;
+            const sellVol = trades.length - buyVol;
+            const avgTrade = trades.length > 0 ? totalVol / trades.length : 0;
+            
+            document.getElementById('stats-grid').innerHTML = `
+                <div class="stat-box"><div class="stat-value">$${totalVol.toFixed(0)}</div><div class="stat-label">Total Volume</div></div>
+                <div class="stat-box"><div class="stat-value">${trades.length}</div><div class="stat-label">Total Trades</div></div>
+                <div class="stat-box"><div class="stat-value">${buyVol}</div><div class="stat-label">Buys</div></div>
+                <div class="stat-box"><div class="stat-value">${sellVol}</div><div class="stat-label">Sells</div></div>
+                <div class="stat-box"><div class="stat-value">${avgTrade.toFixed(2)}</div><div class="stat-label">Avg Trade</div></div>
+                <div class="stat-box"><div class="stat-value">${Object.keys(agents).length}</div><div class="stat-label">Active Agents</div></div>
+            `;
+        }
+        
+        function showAgentDetail(id) {
+            const agent = agents[id];
+            if (!agent) return;
+            
+            const agentTrades = trades.filter(t => t.agent === id);
+            const totalVol = agentTrades.reduce((sum, t) => sum + Math.abs(t.cost), 0);
+            const buyCount = agentTrades.filter(t => t.quantity > 0).length;
+            const sellCount = agentTrades.length - buyCount;
+            
+            const content = `
+                <h2 style="color: #ffa502; margin-bottom: 20px; font-size: 22px;">AGENT: ${id}</h2>
+                <div class="stats-grid">
+                    <div class="stat-box"><div class="stat-value">${agentTrades.length}</div><div class="stat-label">Total Trades</div></div>
+                    <div class="stat-box"><div class="stat-value">${buyCount}</div><div class="stat-label">Buys</div></div>
+                    <div class="stat-box"><div class="stat-value">${sellCount}</div><div class="stat-label">Sells</div></div>
+                    <div class="stat-box"><div class="stat-value">${totalVol.toFixed(2)}</div><div class="stat-label">Volume</div></div>
+                </div>
+                
+                <h3 style="color: #00ff41; margin: 20px 0 10px 0; font-size: 16px;">PORTFOLIO</h3>
+                <div style="background: rgba(26, 31, 46, 0.5); padding: 15px; border: 1px solid #1a1f2e;">
+                    ${Object.entries(agent.balances).map(([asset, amt]) => `
+                        <div style="display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #1a1f2e;">
+                            <span>${asset}</span>
+                            <span style="color: ${amt > 0 ? '#00ff41' : '#ff4757'}; font-weight: bold;">${amt.toFixed(2)}</span>
+                        </div>
+                    `).join('')}
+                </div>
+                
+                <h3 style="color: #00ff41; margin: 20px 0 10px 0; font-size: 16px;">TRADE HISTORY</h3>
+                <div class="trade-list">
+                    ${agentTrades.slice(0, 50).map(t => `
+                        <div class="trade-item ${t.quantity > 0 ? 'trade-buy' : 'trade-sell'}">
+                            <strong>${t.quantity > 0 ? 'BUY' : 'SELL'}</strong> ${Math.abs(t.quantity).toFixed(2)} ${t.market} @ ${Math.abs(t.cost).toFixed(2)}
+                        </div>
+                    `).join('')}
+                </div>
+            `;
+            
+            document.getElementById('modal-content').innerHTML = content;
+            document.getElementById('modal-overlay').classList.add('active');
+            document.getElementById('detail-modal').classList.add('active');
+        }
+        
+        function closeModal() {
+            document.getElementById('modal-overlay').classList.remove('active');
+            document.getElementById('detail-modal').classList.remove('active');
+        }
+        
+        // Spawn form handler
+        document.getElementById('spawn-form').addEventListener('submit', (e) => {
+            e.preventDefault();
+            
+            const statusEl = document.getElementById('spawn-status');
+            statusEl.textContent = "";
 
-    <script src="app.js"></script>
+            const name = document.getElementById('agent-name').value;
+            const model = document.getElementById('agent-model').value;
+            const strategy = document.getElementById('agent-strategy').value;
+
+            if (!socket || socket.readyState !== WebSocket.OPEN) {
+                statusEl.textContent = "Error: Not connected to exchange.";
+                statusEl.style.color = "#ff4757";
+                return;
+            }
+
+            if (!name || !model || !strategy) {
+                statusEl.textContent = "Error: All fields are required.";
+                statusEl.style.color = "#ff4757";
+                return;
+            }
+
+            console.log("Sending spawn request");
+
+            // Send the spawn command via WebSocket
+            socket.send(JSON.stringify({
+                action: "spawn_agent",
+                name: name,
+                model: model,
+                strategy: strategy
+            }));
+
+            console.log("Spawn request sent");
+
+            statusEl.textContent = `Spawn command sent for ${name}...`;
+            statusEl.style.color = "#00ff41";
+            
+            addToDeployLog(`SPAWN COMMAND: Sent for ${name} (Model: ${model})`);
+            addToFeed('SPAWN', `Agent ${name} deployment initiated with ${model}`, 'feed-new');
+            
+            // Clear name for next agent
+            document.getElementById('agent-name').value = "";
+        });
+        
+        function addToDeployLog(msg) {
+            const log = document.getElementById('deploy-log');
+            const item = document.createElement('div');
+            item.style.cssText = 'padding: 8px; margin: 4px 0; font-size: 11px; background: rgba(26, 31, 46, 0.3); border-left: 2px solid #00ff41;';
+            const timestamp = new Date().toLocaleTimeString();
+            item.textContent = `[${timestamp}] ${msg}`;
+            log.insertBefore(item, log.firstChild);
+            if (log.children.length > 50) log.removeChild(log.lastChild);
+        }
+        
+        // Uptime counter
+        setInterval(() => {
+            const elapsed = Math.floor((Date.now() - startTime) / 1000);
+            const h = Math.floor(elapsed / 3600).toString().padStart(2, '0');
+            const m = Math.floor((elapsed % 3600) / 60).toString().padStart(2, '0');
+            const s = (elapsed % 60).toString().padStart(2, '0');
+            document.getElementById('uptime').textContent = `${h}:${m}:${s}`;
+        }, 1000);
+        
+        // Initialize
+        connect();
+        renderMarkets();
+        renderAgents();
+        updateStats();
+        
+        // Add initial message to feed
+        addToFeed('SYSTEM', 'Terminal initialized. Connecting to exchange...', 'feed-new');
+    </script>
 </body>
-
 </html>

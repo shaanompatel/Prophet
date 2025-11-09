@@ -2,7 +2,7 @@ import asyncio
 import json
 import websockets
 from collections import defaultdict
-import math  # --- NEW ---
+import math
 import time
 
 # --- Global State ---
@@ -61,9 +61,9 @@ def get_lmsr_prices(market_name: str) -> dict:
     market = LMSR_MARKETS.get(market_name)
     if not market:
         return {"error": "Market not found"}
-    
+
     q_yes, q_no, b = market["q_yes"], market["q_no"], market["b"]
-    
+
     try:
         exp_yes = math.exp(q_yes / b)
         exp_no = math.exp(q_no / b)
@@ -77,10 +77,10 @@ def get_lmsr_prices(market_name: str) -> dict:
 
     if sum_exp == 0:
         return {"YES": 0.5, "NO": 0.5}
-        
+
     price_yes = exp_yes / sum_exp
     price_no = exp_no / sum_exp
-    
+
     return {"YES": price_yes, "NO": price_no}
 
 async def broadcast_price_update(market_name: str, individual_client=None):
@@ -99,14 +99,14 @@ async def broadcast_price_update(market_name: str, individual_client=None):
         "q_yes": market["q_yes"], # Add q values for the UI
         "q_no": market["q_no"]
     }
-    
+
     if individual_client:
         # Send to just one client (for syncing on connect)
         await individual_client.send(json.dumps(update_msg))
     else:
         # Broadcast to all
         await broadcast_to_traders(update_msg)
-    
+
     return update_msg # Return the message for the sync handler
 
 # --- REMOVED: get_order_book_update ---
@@ -117,70 +117,76 @@ async def trader_client_handler(websocket):
         agent_id = None
         client_type = "trader" # Default
         global AGENT_MANAGER_WS # --- NEW ---
-        
+
         try:
             async for message in websocket:
                 data = json.loads(message)
                 action = data.get("action")
-                
+
                 if action == "register":
-                    # ... (this block is unchanged) ...
                     agent_id = data.get("agent_id")
                     if agent_id in CONNECTED_CLIENTS:
                         await websocket.send(json.dumps({"type": "error", "message": "Agent ID already connected"}))
                         continue
-                    
+
                     CONNECTED_CLIENTS[agent_id] = websocket
                     print(f"[TRADER REGISTER] Agent registered: {agent_id}")
-                    
+
                     if agent_id == MAKER_AGENT_ID:
                         if "USD" not in ACCOUNTS[agent_id]: ACCOUNTS[agent_id]["USD"] = MAKER_INITIAL_USD
                     else:
                         if "USD" not in ACCOUNTS[agent_id]: ACCOUNTS[agent_id]["USD"] = TRADER_INITIAL_USD
-                    
+
+                    # Send private confirmation to the newly registered agent
                     await send_to_trader(agent_id, {"type": "registered", "agent_id": agent_id})
                     await send_to_trader(agent_id, await get_account_update(agent_id))
-                
+
+                    # --- FIX: BROADCAST NEW AGENT'S ACCOUNT TO EVERYONE ---
+                    # This tells the spectator UI that a new agent exists.
+                    new_agent_update = await get_account_update(agent_id)
+                    new_agent_update["agent_id"] = agent_id # Add agent_id for the frontend handler
+                    await broadcast_to_traders(new_agent_update)
+                    # --- END FIX ---
+
                 elif action == "register_spectator":
                     # ... (this block is unchanged) ...
                     client_type = "spectator"
                     agent_id = f"spectator_{int(time.time() * 1000)}"
                     CONNECTED_CLIENTS[agent_id] = websocket
                     print(f"[SPECTATOR REGISTER] Spectator connected: {agent_id}")
-                    
+
                     # --- SYNC FULL STATE ---
                     for existing_agent, balances in ACCOUNTS.items():
                         await send_to_trader(agent_id, {
-                            "type": "account_update", 
+                            "type": "account_update",
                             "balances": balances,
                             "agent_id": existing_agent
                         })
-                    
+
                     for market_name in LMSR_MARKETS:
                         if market_name not in RESOLVED_MARKETS:
-                            # Note: The 'await' was missing here in your provided code, I've added it.
                             await broadcast_price_update(market_name, individual_client=websocket)
-                    
+
                     await send_to_trader(agent_id, {"type": "spectator_registered"})
-                
+
                 # --- NEW BLOCK FOR THE AGENT MANAGER ---
                 elif action == "register_manager":
                     if AGENT_MANAGER_WS is not None:
                         await websocket.send(json.dumps({"type": "error", "message": "Manager already connected"}))
                         continue
-                    
+
                     client_type = "manager"
                     agent_id = "agent_manager"
                     AGENT_MANAGER_WS = websocket
                     print(f"[MANAGER REGISTER] Agent Manager connected: {agent_id}")
                     # This connection will just stay open, listening for disconnects
-                    
+
                 # --- NEW BLOCK FOR SPAWNING ---
                 elif action == "spawn_agent":
                     # This message comes from a spectator (frontend)
                     if client_type != "spectator":
                         continue # Only spectators can send this
-                        
+
                     print(f"[EXCHANGE] Received spawn command from {agent_id}.")
                     if AGENT_MANAGER_WS:
                         # Forward the command to the manager
@@ -212,7 +218,7 @@ async def trader_client_handler(websocket):
         finally:
             if agent_id in CONNECTED_CLIENTS:
                 del CONNECTED_CLIENTS[agent_id]
-            
+
             # --- NEW: Double-check manager is cleared ---
             if websocket == AGENT_MANAGER_WS:
                 AGENT_MANAGER_WS = None
@@ -221,7 +227,7 @@ async def trader_client_handler(websocket):
 async def handle_amm_trade(agent_id, data):
     """Processes a 'trade' request against the AMM."""
     asset_name = data.get("market") # e.g., "Election_YES"
-    
+
     try:
         quantity = float(data.get("quantity"))
     except Exception:
@@ -232,7 +238,7 @@ async def handle_amm_trade(agent_id, data):
         if outcome not in ["YES", "NO"]: raise ValueError()
     except Exception:
         return await send_to_trader(agent_id, {"type": "error", "message": f"Invalid market asset name: {asset_name}"})
-    
+
     if market_name in RESOLVED_MARKETS:
         return await send_to_trader(agent_id, {"type": "error", "message": f"Market {market_name} is resolved."})
     if market_name not in LMSR_MARKETS:
@@ -240,26 +246,26 @@ async def handle_amm_trade(agent_id, data):
 
     market = LMSR_MARKETS[market_name]
     q_yes, q_no, b = market["q_yes"], market["q_no"], market["b"]
-    
+
     current_cost = get_lmsr_cost(q_yes, q_no, b)
-    
+
     trade_cost = 0.0
-    
+
     # --- BUYING (quantity is positive) ---
     if quantity > 0:
         new_q_yes = q_yes + quantity if outcome == "YES" else q_yes
         new_q_no = q_no + quantity if outcome == "NO" else q_no
-        
+
         new_cost = get_lmsr_cost(new_q_yes, new_q_no, b)
         trade_cost = new_cost - current_cost
-        
+
         if ACCOUNTS[agent_id]["USD"] < trade_cost:
             return await send_to_trader(agent_id, {"type": "error", "message": "Insufficient USD"})
-        
+
         ACCOUNTS[agent_id]["USD"] -= trade_cost
         ACCOUNTS[agent_id][asset_name] += quantity
         ACCOUNTS[MAKER_AGENT_ID]["USD"] += trade_cost # AMM "house" gets the USD
-        
+
         market["q_yes"], market["q_no"] = new_q_yes, new_q_no
         print(f"[TRADE] {agent_id} BUYS {quantity} {asset_name} for ${trade_cost:.3f}")
 
@@ -268,41 +274,41 @@ async def handle_amm_trade(agent_id, data):
         dq = abs(quantity)
         if ACCOUNTS[agent_id].get(asset_name, 0) < dq:
             return await send_to_trader(agent_id, {"type": "error", "message": f"Insufficient {asset_name} tokens"})
-        
+
         new_q_yes = q_yes - dq if outcome == "YES" else q_yes
         new_q_no = q_no - dq if outcome == "NO" else q_no
 
         new_cost = get_lmsr_cost(new_q_yes, new_q_no, b)
         payout = current_cost - new_cost
         trade_cost = -payout # Store negative cost for logging
-        
+
         ACCOUNTS[agent_id]["USD"] += payout
         ACCOUNTS[agent_id][asset_name] -= dq
         ACCOUNTS[MAKER_AGENT_ID]["USD"] -= payout # AMM "house" pays out USD
-        
+
         market["q_yes"], market["q_no"] = new_q_yes, new_q_no
         print(f"[TRADE] {agent_id} SELLS {dq} {asset_name} for ${payout:.3f}")
-    
+
     else:
         return await send_to_trader(agent_id, {"type": "error", "message": "Quantity cannot be zero"})
 
     # --- Notify participants ---
     print(get_exchange_state_string())
-    
+
     # Send private update to the trader
     await send_to_trader(agent_id, await get_account_update(agent_id))
-    
+
     # --- BROADCAST ACCOUNT UPDATES FOR SPECTATORS ---
     # We create a custom message here to include the agent_id in the broadcast
     trader_update = await get_account_update(agent_id)
     trader_update["agent_id"] = agent_id
     await broadcast_to_traders(trader_update)
-    
+
     maker_update = await get_account_update(MAKER_AGENT_ID)
     maker_update["agent_id"] = MAKER_AGENT_ID
     await broadcast_to_traders(maker_update)
     # --- END OF NEW BLOCK ---
-    
+
     trade_message = {
         "type": "trade_executed", "market": asset_name, "quantity": quantity,
         "agent": agent_id, "cost": trade_cost
@@ -315,12 +321,12 @@ async def handle_amm_trade(agent_id, data):
 async def internal_handle_create(data: dict):
     """Processes a CREATE action from the AI."""
     market_name = data.get("market_name")
-    
+
     # Clamp probability to avoid math.log(0)
     prob_yes = max(0.001, min(0.999, data.get("probability", 0.5)))
     prob_no = 1.0 - prob_yes
     b_value = data.get("b_value", LMSR_B_VALUE)
-    
+
     market_yes = f"{market_name}_YES"
     market_no = f"{market_name}_NO"
 
@@ -329,12 +335,12 @@ async def internal_handle_create(data: dict):
         return
 
     print(f"\n[AI ACTION] Received CREATE: {market_name} (Prob={prob_yes}, b={b_value})")
-    
+
     # 1. Calculate initial q values to set the desired starting price
     # We set initial q_yes = b * log(P_yes) and q_no = b * log(P_no)
     initial_q_yes = b_value * math.log(prob_yes)
     initial_q_no = b_value * math.log(prob_no)
-    
+
     # 2. Create the market
     LMSR_MARKETS[market_name] = {
         "q_yes": initial_q_yes,
@@ -351,7 +357,7 @@ async def internal_handle_create(data: dict):
         "market_no": market_no,
         "created_by": MAKER_AGENT_ID
     })
-    
+
     # 4. Broadcast initial prices
     await broadcast_price_update(market_name)
 
@@ -359,7 +365,7 @@ async def internal_handle_resolve(data: dict):
     """Processes a RESOLVE action from the AI."""
     market_name = data.get("market_name")
     outcome = data.get("outcome", "YES").upper()
-    
+
     market_yes = f"{market_name}_YES"
     market_no = f"{market_name}_NO"
 
@@ -373,7 +379,7 @@ async def internal_handle_resolve(data: dict):
     RESOLVED_MARKETS.add(market_name)
     if market_name in LMSR_MARKETS:
         del LMSR_MARKETS[market_name] # Remove from active AMMs
-    
+
     winning_token = market_yes if outcome == "YES" else market_no
     losing_token = market_no if outcome == "YES" else market_yes
 
@@ -386,12 +392,12 @@ async def internal_handle_resolve(data: dict):
                 print(f"  > Paying {agent} ${winnings} for {winnings} {winning_token} tokens")
                 balances["USD"] += winnings
                 balances[winning_token] = 0.0
-        
+
         if losing_token in balances:
             if balances[losing_token] > 0:
                 print(f"  > Clearing {balances[losing_token]} worthless {losing_token} tokens from {agent}")
                 balances[losing_token] = 0.0
-                
+
     # 3. Notify all connected *traders*
     await broadcast_to_traders({
         "type": "market_resolved",
@@ -416,12 +422,12 @@ async def listen_to_ai_actions():
                     try:
                         data = json.loads(message)
                         action = data.get("action")
-                        
+
                         if action == "CREATE":
                             await internal_handle_create(data)
                         elif action == "RESOLVE":
                             await internal_handle_resolve(data)
-                            
+
                     except json.JSONDecodeError:
                         print(f"Error: Invalid JSON from AI: {message}")
                     except Exception as e:
@@ -431,7 +437,7 @@ async def listen_to_ai_actions():
             print("AI Server connection lost. Reconnecting in 5s...")
         except Exception as e:
             print(f"Error connecting to AI Server: {e}. Retrying in 5s...")
-        
+
         await asyncio.sleep(5)
 
 def get_exchange_state_string():
@@ -453,7 +459,7 @@ def get_exchange_state_string():
     output.append("\n--- LMSR MARKETS (Prices) ---")
     if not LMSR_MARKETS:
         output.append("  (no active markets)")
-        
+
     for market_name, market in LMSR_MARKETS.items():
         if market_name in RESOLVED_MARKETS:
             continue
@@ -473,13 +479,13 @@ async def main():
     print(f"--- Exchange Server (LMSR AMM) starting... ---") # Updated
     print(f"   > Will listen for traders on ws://{EXCHANGE_HOST}:{EXCHANGE_PORT}")
     print(f"   > Will listen for AI on ws://{AI_ACTION_URL}")
-    
+
     # 1. Initialize the market_maker's USD account
     ACCOUNTS[MAKER_AGENT_ID]["USD"] = MAKER_INITIAL_USD
 
     # 2. Start the AI listener as a background task
     asyncio.create_task(listen_to_ai_actions())
-    
+
     # 3. Start the trader server
     async with websockets.serve(trader_client_handler, EXCHANGE_HOST, EXCHANGE_PORT):
         await asyncio.Future()  # Run forever
