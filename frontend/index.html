@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Live Exchange Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <header>
+        <h1>Live Exchange Dashboard</h1>
+        <div id="connection-status" class="status-disconnected">
+            CONNECTING...
+        </div>
+    </header>
+
+    <div class="container">
+        <div class="column">
+            <h2>📈 Active Markets</h2>
+            <div id="markets-container">
+            </div>
+        </div>
+
+        <div class="column">
+            <h2>🤖 Agent Holdings</h2>
+            <div id="agents-container">
+            </div>
+        </div>
+
+        <div class="column">
+            <h2>Feed</h2>
+            <div id="trade-feed-container">
+            </div>
+        </div>
+    </div>
+
+    <div class="column">
+        <h2>🚀 Spawn New Agent</h2>
+        <form id="spawn-form">
+            <div class="form-group">
+                <label for="agent-name">Agent Name:</label>
+                <input type="text" id="agent-name" value="Trader_Charlie" required>
+            </div>
+            <div class="form-group">
+                <label for="agent-model">OpenRouter Model:</label>
+                <input type="text" id="agent-model" value="mistralai/mistral-7b-instruct" required>
+            </div>
+            <div class="form-group">
+                <label for="agent-strategy">Strategy Prompt:</label>
+                <textarea id="agent-strategy" rows="6"
+                    required>You are a very cautious, long-term trader. You only buy assets you believe are severely underpriced (prob > 0.3 from market) and hold them.</textarea>
+            </div>
+            <button type="submit" id="spawn-button">Spawn Agent</button>
+        </form>
+        <div id="spawn-status"></div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+
+</html>

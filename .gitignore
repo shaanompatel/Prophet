@@ -7,3 +7,6 @@ backend/X/X/x_scraping/bearerkey.env
 backend/X/X/x_scraping/xAIAPIKey.env
 backend/X/X/x_scraping/tweets.log
 backend/X/X/x_scraping/markets.log
+*.log
+log/
+pid/

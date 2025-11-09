@@ -1,0 +1,156 @@
+/* ADD THIS CSS to style.css */
+.form-group {
+    margin-bottom: 15px;
+}
+.form-group label {
+    display: block;
+    margin-bottom: 5px;
+    font-weight: 500;
+}
+.form-group input,
+.form-group textarea {
+    width: 100%;
+    padding: 8px;
+    box-sizing: border-box; /* Important */
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-family: inherit;
+    font-size: 0.95rem;
+}
+button#spawn-button {
+    background-color: #3498db;
+    color: white;
+    padding: 10px 15px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 1rem;
+    font-weight: bold;
+}
+button#spawn-button:hover {
+    background-color: #2980b9;
+}
+#spawn-status {
+    margin-top: 10px;
+    font-size: 0.9rem;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background-color: #f4f7f6;
+    color: #333;
+    margin: 0;
+    line-height: 1.6;
+}
+
+header {
+    background-color: #fff;
+    padding: 1rem 2rem;
+    border-bottom: 2px solid #ddd;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+h1 {
+    color: #2c3e50;
+    margin: 0;
+}
+
+h2 {
+    border-bottom: 2px solid #eee;
+    padding-bottom: 10px;
+    color: #34495e;
+}
+
+.container {
+    display: flex;
+    flex-wrap: wrap;
+    padding: 20px;
+}
+
+.column {
+    flex: 1;
+    min-width: 300px;
+    margin: 10px;
+    padding: 20px;
+    background-color: #fff;
+    border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
+}
+
+/* Connection Status */
+#connection-status {
+    padding: 8px 12px;
+    border-radius: 5px;
+    font-weight: bold;
+    color: #fff;
+}
+.status-connected { background-color: #2ecc71; }
+.status-disconnected { background-color: #e74c3c; }
+
+/* Markets */
+.market {
+    margin-bottom: 20px;
+    border: 1px solid #eee;
+    border-radius: 5px;
+    padding: 15px;
+}
+.market-name {
+    font-weight: bold;
+    font-size: 1.1rem;
+    color: #2980b9;
+    margin-bottom: 10px;
+}
+.market-prices, .market-pool {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 5px;
+    font-size: 0.95rem;
+}
+.price-yes { color: #27ae60; }
+.price-no { color: #c0392b; }
+.market-pool {
+    font-size: 0.8rem;
+    color: #7f8c8d;
+    border-top: 1px dashed #eee;
+    padding-top: 5px;
+    margin-top: 10px;
+}
+
+/* Agents */
+.agent {
+    margin-bottom: 20px;
+}
+.agent-name {
+    font-weight: bold;
+    color: #8e44ad;
+    margin-bottom: 10px;
+    font-size: 1.1rem;
+}
+.agent-holdings ul {
+    margin: 0;
+    padding-left: 20px;
+}
+.agent-holdings li {
+    list-style-type: square;
+    display: flex;
+    justify-content: space-between;
+}
+.holding-asset { font-weight: 500; }
+.holding-amount { font-family: monospace; }
+
+/* Trade Feed */
+#trade-feed-container {
+    max-height: 400px;
+    overflow-y: auto;
+    font-size: 0.9rem;
+}
+#trade-feed-container p {
+    margin: 0 0 8px 0;
+    padding-bottom: 8px;
+    border-bottom: 1px solid #f0f0f0;
+}
+.trade-buy { color: #27ae60; }
+.trade-sell { color: #c0392b; }
+.trade-resolve { color: #34495e; font-weight: bold; }
