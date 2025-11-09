@@ -10,3 +10,4 @@ backend/X/X/x_scraping/markets.log
 *.log
 log/
 pid/
+backend/X/X/x_scraping/since_id.json
