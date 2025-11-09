@@ -1,41 +1,39 @@
-use std::{
-    collections::HashMap,
-    env,
-    fs,
-    path::Path,
-    sync::Mutex,
-};
+mod protocol;
+mod trader_server;
+mod types;
 
-use dotenvy::dotenv;
+use std::{env, fs, net::SocketAddr, path::Path, sync::Arc};
+use tokio::time::{sleep, Duration};
 use anyhow::Result;
+use dotenvy::dotenv;
 use futures::{SinkExt, StreamExt};
-use once_cell::sync::Lazy;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio_tungstenite::connect_async;
 use tungstenite::Message;
 
-use borsh::{BorshDeserialize, BorshSerialize};
+use borsh::BorshSerialize;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
     instruction::{AccountMeta, Instruction},
-    program_pack::Pack,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
     system_instruction,
     transaction::Transaction,
 };
+use solana_sdk::program_pack::Pack;
 use spl_token::{
     id as spl_token_program_id,
     instruction as token_instruction,
-    state::{Account as TokenAccount, Mint},
+    state::Mint,
 };
 
-const ACTION_WS_URL: &str = "ws://localhost:8766";
+use crate::protocol::{ProphetInstruction, MARKET_SEED};
+use crate::trader_server::{TraderServer, TraderServerConfig};
+use crate::types::{MarketInfo, MARKET_REGISTRY};
 
-/// Must match on-chain MARKET_SEED
-const MARKET_SEED: &[u8] = b"market";
+const ACTION_WS_URL: &str = "ws://localhost:8766";
 
 /// One AI action from decide_markets.py
 #[derive(Debug, Deserialize)]
@@ -47,47 +45,8 @@ struct Action {
     reason: Option<String>,
 }
 
-/// The instruction enum layout MUST match the on-chain program.
-#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
-pub enum ProphetInstruction {
-    InitializeMarket {
-        event_id: [u8; 32],
-        category: u8,
-        end_timestamp: i64,
-    },
-    BuyYes {
-        amount: u64,
-    },
-    SellYes {
-        amount: u64,
-    },
-    BuyNo {
-        amount: u64,
-    },
-    SellNo {
-        amount: u64,
-    },
-    ResolveMarket {
-        outcome: u8,
-    },
-}
-
-/// Info we keep in memory per market so RESOLVE can find it.
-struct MarketInfo {
-    event_id: [u8; 32],
-    market_pubkey: Pubkey,
-    yes_mint: Pubkey,
-    no_mint: Pubkey,
-    yes_vault: Pubkey,
-    no_vault: Pubkey,
-}
-
-static MARKET_REGISTRY: Lazy<Mutex<HashMap<String, MarketInfo>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load variables from .env if present
     dotenv().ok();
 
     // --- Load env config ---
@@ -98,61 +57,133 @@ async fn main() -> Result<()> {
     let rpc_url = env::var("SOLANA_RPC_URL")
         .unwrap_or_else(|_| "https://api.devnet.solana.com".to_string());
 
+    // Where Python trader agents connect (defaults to 127.0.0.1:8767)
+    let listen_addr: SocketAddr = env::var("TRADER_SERVER_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:8767".to_string())
+        .parse()
+        .expect("Invalid TRADER_SERVER_ADDR");
+
+    // --- Load payer keypair ---
     let keypair_path = dirs::home_dir()
         .expect("no home dir")
         .join(".config/solana/id.json");
-    let payer = read_keypair(&keypair_path)?;
+    let payer = Arc::new(read_keypair(&keypair_path)?);
 
-    let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+    // RPC client used by the bridge for CREATE / RESOLVE
+    let client =
+        RpcClient::new_with_commitment(rpc_url.clone(), CommitmentConfig::confirmed());
 
-    println!("[bridge] Wallet:  {}", payer.pubkey());
-    println!("[bridge] Program: {}", program_id);
-    println!("[bridge] RPC:     {}", client.url());
+    println!("[bridge] Wallet:    {}", payer.pubkey());
+    println!("[bridge] Program:   {}", program_id);
+    println!("[bridge] RPC:       {}", client.url());
+    println!("[bridge] Trader WS: ws://{}", listen_addr);
 
-    // --- Connect to AI Action WebSocket ---
-    println!("[bridge] Connecting to {}", ACTION_WS_URL);
-    let (ws_stream, _) = connect_async(ACTION_WS_URL).await?;
-    println!("[bridge] Connected to AI action server");
+    // --- Start Rust trader server (Python LLM agents connect here) ---
+    let trader_cfg = TraderServerConfig {
+        listen_addr,
+        program_id,
+    };
+    let trader_server = Arc::new(TraderServer::new(trader_cfg, rpc_url.clone(), payer.clone()));
+    {
+        let srv = trader_server.clone();
+        tokio::spawn(async move {
+            if let Err(e) = srv.run().await {
+                eprintln!("[trader-server] fatal error: {e:?}");
+            }
+        });
+    }
 
-    let (mut ws_write, mut ws_read) = ws_stream.split();
+    // --- Connect to AI Action WebSocket (CREATE / RESOLVE) in a retry loop ---
+    loop {
+        println!("[bridge] Connecting to AI action server at {}", ACTION_WS_URL);
 
-    while let Some(msg) = ws_read.next().await {
-        let msg = msg?;
-        if msg.is_text() {
-            let text = msg.to_text()?;
-            match serde_json::from_str::<Action>(text) {
-                Ok(action) => {
-                    println!("\n[bridge] Received Action: {:?}", action);
+        match connect_async(ACTION_WS_URL).await {
+            Ok((ws_stream, _)) => {
+                println!("[bridge] Connected to AI action server");
 
-                    match action.action.as_str() {
-                        "CREATE" => {
-                            handle_create(&client, &payer, &program_id, &action).await?;
-                            // Optional ack back to AI
-                            ws_write
-                                .send(Message::Text(
-                                    r#"{"status":"ok","type":"CREATE"}"#.into(),
-                                ))
-                                .await?;
+                let (mut ws_write, mut ws_read) = ws_stream.split();
+
+                while let Some(msg) = ws_read.next().await {
+                    let msg = match msg {
+                        Ok(m) => m,
+                        Err(e) => {
+                            eprintln!("[bridge] WebSocket read error: {e}. Reconnecting...");
+                            break;
                         }
-                        "RESOLVE" => {
-                            handle_resolve(&client, &payer, &program_id, &action).await?;
-                            ws_write
-                                .send(Message::Text(
-                                    r#"{"status":"ok","type":"RESOLVE"}"#.into(),
-                                ))
-                                .await?;
+                    };
+
+                    if !msg.is_text() {
+                        continue;
+                    }
+                    let text = match msg.to_text() {
+                        Ok(t) => t,
+                        Err(e) => {
+                            eprintln!("[bridge] Failed to read text from WS message: {e}");
+                            continue;
                         }
-                        other => {
-                            eprintln!("[bridge] Unknown action type: {}", other);
+                    };
+
+                    match serde_json::from_str::<Action>(text) {
+                        Ok(action) => {
+                            println!("\n[bridge] Received Action: {:?}", action);
+
+                            match action.action.as_str() {
+                                "CREATE" => {
+                                    if let Err(e) = handle_create(
+                                        &client,
+                                        payer.as_ref(),
+                                        &program_id,
+                                        &trader_server,
+                                        &action,
+                                    ).await {
+                                        eprintln!("[bridge] Error in CREATE handler: {e:?}");
+                                    } else {
+                                        let _ = ws_write
+                                            .send(Message::Text(r#"{"status":"ok","type":"CREATE"}"#.into()))
+                                            .await;
+                                    }
+                                }
+                                "RESOLVE" => {
+                                    if let Err(e) = handle_resolve(
+                                        &client,
+                                        payer.as_ref(),
+                                        &program_id,
+                                        &trader_server,
+                                        &action,
+                                    ).await {
+                                        eprintln!("[bridge] Error in RESOLVE handler: {e:?}");
+                                    } else {
+                                        let _ = ws_write
+                                            .send(Message::Text(r#"{"status":"ok","type":"RESOLVE"}"#.into()))
+                                            .await;
+                                    }
+                                }
+                                other => {
+                                    eprintln!("[bridge] Unknown action type: {}", other);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[bridge] Failed to parse JSON action: {e}. Raw: {text}");
                         }
                     }
                 }
-                Err(e) => {
-                    eprintln!("[bridge] Failed to parse JSON action: {e}. Raw: {text}");
-                }
+
+                // If we drop out of the inner while-loop, the WS closed/error’d.
+                eprintln!("[bridge] Action WS connection closed. Reconnecting in 5s...");
+            }
+
+            Err(e) => {
+                eprintln!(
+                    "[bridge] Failed to connect to AI action server {}: {e}. Retrying in 5s...",
+                    ACTION_WS_URL
+                );
             }
         }
+
+        sleep(Duration::from_secs(5)).await;
     }
+
 
     Ok(())
 }
@@ -176,13 +207,14 @@ fn event_id_from_name(name: &str) -> [u8; 32] {
 }
 
 // --------------------------------------------------------
-// CREATE handler: full on-chain setup + InitializeMarket
+// CREATE handler: on-chain setup + InitializeMarket + notify traders
 // --------------------------------------------------------
 
 async fn handle_create(
     client: &RpcClient,
     payer: &Keypair,
     program_id: &Pubkey,
+    trader_srv: &Arc<TraderServer>,
     action: &Action,
 ) -> Result<()> {
     let market_name = &action.market_name;
@@ -199,24 +231,20 @@ async fn handle_create(
         market_pda
     );
 
-    // New accounts for mints and vaults
+    // New accounts for YES/NO mints
     let yes_mint_kp = Keypair::new();
     let no_mint_kp = Keypair::new();
-    let yes_vault_kp = Keypair::new();
-    let no_vault_kp = Keypair::new();
 
-    // Rent-exempt balances for SPL accounts
+    // Rent-exempt balances for SPL mints
     let mint_rent = client
         .get_minimum_balance_for_rent_exemption(Mint::LEN)
         .await?;
-    let ata_rent = client
-        .get_minimum_balance_for_rent_exemption(TokenAccount::LEN)
-        .await?;
 
-    // ---------- Transaction 1: create + init mints and vaults ----------
+    // ---------- Transaction 1: create + init mints ----------
+
     let mut ixs = vec![];
 
-    // YES mint
+    // YES mint account
     ixs.push(system_instruction::create_account(
         &payer.pubkey(),
         &yes_mint_kp.pubkey(),
@@ -225,7 +253,7 @@ async fn handle_create(
         &spl_token_program_id(),
     ));
 
-    // NO mint
+    // NO mint account
     ixs.push(system_instruction::create_account(
         &payer.pubkey(),
         &no_mint_kp.pubkey(),
@@ -234,87 +262,26 @@ async fn handle_create(
         &spl_token_program_id(),
     ));
 
-    // YES vault token account
-    ixs.push(system_instruction::create_account(
-        &payer.pubkey(),
-        &yes_vault_kp.pubkey(),
-        ata_rent,
-        TokenAccount::LEN as u64,
-        &spl_token_program_id(),
-    ));
-
-    // NO vault token account
-    ixs.push(system_instruction::create_account(
-        &payer.pubkey(),
-        &no_vault_kp.pubkey(),
-        ata_rent,
-        TokenAccount::LEN as u64,
-        &spl_token_program_id(),
-    ));
-
-    // Initialize YES mint (6 decimals)
+    // Initialize YES mint (6 decimals), mint_authority = Market PDA
     ixs.push(token_instruction::initialize_mint(
         &spl_token_program_id(),
         &yes_mint_kp.pubkey(),
-        &payer.pubkey(), // mint authority
+        &market_pda, // mint authority = PDA
         None,
         6,
     )?);
 
-    // Initialize NO mint
+    // Initialize NO mint (6 decimals), mint_authority = Market PDA
     ixs.push(token_instruction::initialize_mint(
         &spl_token_program_id(),
         &no_mint_kp.pubkey(),
-        &payer.pubkey(),
+        &market_pda, // mint authority = PDA
         None,
         6,
-    )?);
-
-    // Initialize YES vault account (token account owner = Market PDA)
-    ixs.push(token_instruction::initialize_account(
-        &spl_token_program_id(),
-        &yes_vault_kp.pubkey(),
-        &yes_mint_kp.pubkey(),
-        &market_pda, // <-- PDA is vault owner
-    )?);
-
-    // Initialize NO vault account (token account owner = Market PDA)
-    ixs.push(token_instruction::initialize_account(
-        &spl_token_program_id(),
-        &no_vault_kp.pubkey(),
-        &no_mint_kp.pubkey(),
-        &market_pda, // <-- PDA is vault owner
-    )?);
-
-    // Mint initial liquidity into both vaults (1,000 units each)
-    let initial_liquidity: u64 = 1_000 * 10u64.pow(6); // 1000 * 10^6
-
-    ixs.push(token_instruction::mint_to(
-        &spl_token_program_id(),
-        &yes_mint_kp.pubkey(),
-        &yes_vault_kp.pubkey(),
-        &payer.pubkey(),
-        &[],
-        initial_liquidity,
-    )?);
-
-    ixs.push(token_instruction::mint_to(
-        &spl_token_program_id(),
-        &no_mint_kp.pubkey(),
-        &no_vault_kp.pubkey(),
-        &payer.pubkey(),
-        &[],
-        initial_liquidity,
     )?);
 
     let recent = client.get_latest_blockhash().await?;
-    let signers: [&Keypair; 5] = [
-        payer,
-        &yes_mint_kp,
-        &no_mint_kp,
-        &yes_vault_kp,
-        &no_vault_kp,
-    ];
+    let signers: [&Keypair; 3] = [payer, &yes_mint_kp, &no_mint_kp];
 
     let tx = Transaction::new_signed_with_payer(
         &ixs,
@@ -324,12 +291,12 @@ async fn handle_create(
     );
 
     let sig = client.send_and_confirm_transaction(&tx).await?;
-    println!("[bridge] Mint & vault setup tx: {}", sig);
+    println!("[bridge] Mint setup tx: {}", sig);
 
     // ---------- Transaction 2: call InitializeMarket on your program ----------
 
-    let category: u8 = 0;        // e.g. 0 = generic
-    let end_timestamp: i64 = 0;  // you can choose to set a real expiry later
+    let category: u8 = 0;       // e.g. 0 = generic
+    let end_timestamp: i64 = 0; // set real expiry later if you want
 
     let init_ix_data = ProphetInstruction::InitializeMarket {
         event_id,
@@ -345,8 +312,6 @@ async fn handle_create(
             AccountMeta::new_readonly(payer.pubkey(), true),
             AccountMeta::new_readonly(yes_mint_kp.pubkey(), false),
             AccountMeta::new_readonly(no_mint_kp.pubkey(), false),
-            AccountMeta::new(yes_vault_kp.pubkey(), false),
-            AccountMeta::new(no_vault_kp.pubkey(), false),
             AccountMeta::new_readonly(spl_token_program_id(), false),
             AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
         ],
@@ -366,39 +331,41 @@ async fn handle_create(
     let sig2 = client.send_and_confirm_transaction(&tx2).await?;
     println!("[bridge] InitializeMarket tx: {}", sig2);
 
-    // Store info so RESOLVE knows which account to target
+    // Store info so RESOLVE + trader server know where the market is
     let info = MarketInfo {
         event_id,
         market_pubkey: market_pda,
         yes_mint: yes_mint_kp.pubkey(),
         no_mint: no_mint_kp.pubkey(),
-        yes_vault: yes_vault_kp.pubkey(),
-        no_vault: no_vault_kp.pubkey(),
     };
 
     MARKET_REGISTRY
         .lock()
         .unwrap()
-        .insert(market_name.clone(), info);
+        .insert(market_name.clone(), info.clone());
+
+    // Tell connected trader agents about the new market
+    trader_srv.broadcast_new_market(market_name, action.probability)?;
 
     Ok(())
 }
 
 // --------------------------------------------------------
-// RESOLVE handler: call ResolveMarket on-chain
+// RESOLVE handler: call ResolveMarket on-chain + notify traders
 // --------------------------------------------------------
 
 async fn handle_resolve(
     client: &RpcClient,
     payer: &Keypair,
     program_id: &Pubkey,
+    trader_srv: &Arc<TraderServer>,
     action: &Action,
 ) -> Result<()> {
     let market_name = &action.market_name;
 
     let registry = MARKET_REGISTRY.lock().unwrap();
     let info = match registry.get(market_name) {
-        Some(i) => i,
+        Some(i) => i.clone(),
         None => {
             eprintln!(
                 "[bridge] Unknown market '{}' (maybe bridge restarted). Resolution skipped.",
@@ -407,6 +374,7 @@ async fn handle_resolve(
             return Ok(());
         }
     };
+    drop(registry);
 
     let outcome_str = action
         .outcome
@@ -444,6 +412,9 @@ async fn handle_resolve(
 
     let sig = client.send_and_confirm_transaction(&tx).await?;
     println!("[bridge] ResolveMarket tx: {}", sig);
+
+    // Notify trader agents so they stop trading this market
+    trader_srv.broadcast_market_resolved(market_name, &outcome_str)?;
 
     Ok(())
 }

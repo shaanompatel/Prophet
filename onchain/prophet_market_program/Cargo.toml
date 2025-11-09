@@ -12,6 +12,7 @@ solana-program = "1.18.0"
 borsh = "0.10.4"
 borsh-derive = "0.10.4"
 spl-token = { version = "4.0.0", features = ["no-entrypoint"] }
+libm = "0.2"
 
 [profile.release]
 opt-level = "s"

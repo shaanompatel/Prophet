@@ -222,7 +222,7 @@ class AgenticTrader:
             print(f"[{self.agent_id}] Error in exchange listener: {e}")
 
     async def _listen_to_tweets(self):
-        """Listens FOR messages FROM the tweet stream."""
+        """Listens FOR messages FROM the tweet stream and triggers AI decisions."""
         print(f"[{self.agent_id}] Tweet listener connecting to {self.tweet_server_uri}...")
         tweet_buffer = []
 
@@ -230,61 +230,97 @@ class AgenticTrader:
             try:
                 async with websockets.connect(self.tweet_server_uri) as tweet_ws:
                     print(f"[{self.agent_id}] Tweet listener connected!")
+                    tweet_buffer = []
 
-                    async for message in tweet_ws:
-                        tweet = json.loads(message)
-                        tweet_buffer.append(tweet)
+                    try:
+                        async for message in tweet_ws:
+                            tweet = json.loads(message)
+                            tweet_buffer.append(tweet)
 
-                        if len(tweet_buffer) >= self.buffer_size:
-                            ai_decision = await self._get_ai_decision(tweet_buffer)
-                            self.historical_context.extend(tweet_buffer)
-                            tweet_buffer = []
+                            if len(tweet_buffer) >= self.buffer_size:
+                                # 1. Ask AI what to do
+                                try:
+                                    ai_decision = await self._get_ai_decision(tweet_buffer)
+                                except Exception as e:
+                                    print(f"   [{self.agent_id}] AI Error during decision: {e}")
+                                    tweet_buffer = []
+                                    continue
 
-                            actions = ai_decision.get("actions", [])
-                            if not actions:
-                                print(f"   [{self.agent_id}] AI: No actions to take.")
-                            else:
-                                available_usd_for_batch = self.portfolio.get("USD", 0)
-                                available_tokens_for_batch = self.portfolio.copy()
+                                self.historical_context.extend(tweet_buffer)
+                                tweet_buffer = []
 
-                                for action in actions:
-                                    if action.get("action") == "TRADE":
-                                        usd_spent, token_market, tokens_sold = await self._process_ai_trade(
-                                            action,
-                                            available_usd_for_batch,
-                                            available_tokens_for_batch
-                                        )
-                                        available_usd_for_batch -= usd_spent
-                                        if token_market:
-                                            available_tokens_for_batch[token_market] -= tokens_sold
-            except Exception:
-                print(f"[{self.agent_id}] Tweet stream connection lost. Reconnecting in 5s...")
+                                # 2. Act on decision
+                                actions = ai_decision.get("actions", [])
+                                if not actions:
+                                    print(f"   [{self.agent_id}] AI: No actions to take.")
+                                else:
+                                    available_usd_for_batch = self.portfolio.get("USD", 0)
+                                    available_tokens_for_batch = self.portfolio.copy()
+
+                                    for action in actions:
+                                        if action.get("action") == "TRADE":
+                                            try:
+                                                usd_spent, token_market, tokens_sold = await self._process_ai_trade(
+                                                    action,
+                                                    available_usd_for_batch,
+                                                    available_tokens_for_batch
+                                                )
+                                                available_usd_for_batch -= usd_spent
+                                                if token_market:
+                                                    available_tokens_for_batch[token_market] -= tokens_sold
+                                            except Exception as e:
+                                                # Trade error should NOT kill tweet stream
+                                                print(f"   [{self.agent_id}] Trade error: {e}")
+
+                    except websockets.exceptions.ConnectionClosed:
+                        # Only hitting this if the tweet websocket itself closes
+                        print(f"[{self.agent_id}] Tweet stream connection closed. Reconnecting in 5s...")
+
+            except OSError as e:
+                # Can't connect to tweet server at all
+                print(f"[{self.agent_id}] Tweet stream connection error: {e}. Retrying in 5s...")
+            except Exception as e:
+                # Any other outer error
+                print(f"[{self.agent_id}] Unexpected tweet listener error: {e}. Retrying in 5s...")
+
             await asyncio.sleep(5)
+
+
+    async def _safe_send_to_exchange(self, payload: dict) -> bool:
+        if not self.ws_exchange:
+            print(f"[{self.agent_id}] Cannot send order: not connected to exchange.")
+            return False
+        try:
+            await self.ws_exchange.send(json.dumps(payload))
+            return True
+        except websockets.exceptions.ConnectionClosed as e:
+            print(f"[{self.agent_id}] Exchange connection closed while sending order: {e}")
+            return False
+        except Exception as e:
+            print(f"[{self.agent_id}] Error sending order to exchange: {e}")
+            return False
 
     # --- 2. UPDATED, SAFER TRADE LOGIC ---
     async def _process_ai_trade(self, action: dict, available_usd: float, available_tokens: dict) -> tuple:
         """
         Calculates quantity based on a STANDARD_TRADE_QUANTITY to avoid
-        divide-by-zero errors with market price.
+        divide-by-zero errors with market price, and uses _safe_send_to_exchange
+        so exchange failures don't kill the tweet listener.
         """
-        
-        # --- NEW LOGIC ---
-        # A "full" 100% trade (trade_size_pct: 1.0) will be 100 shares.
-        # A 30% trade (trade_size_pct: 0.3) will be 30 shares.
-        # This avoids all division by 'current_price'.
-        STANDARD_TRADE_QUANTITY = 100.0 
+
+        STANDARD_TRADE_QUANTITY = 100.0  # "100% trade" = 100 shares
 
         side = action.get("side")
         market_asset = action.get("market_asset")
         trade_size_pct = action.get("trade_size_pct", 0.1)  # Default to 10% (10 shares)
-        
+
         # Handle cases where AI might pass a string or None
         try:
             trade_size_pct = float(trade_size_pct)
         except (ValueError, TypeError):
             trade_size_pct = 0.1  # Default to 10%
 
-        print(f"--- [{self.agent_id}] AI ACTION: {side} {market_asset} ({trade_size_pct*100}%) ---")
+        print(f"--- [{self.agent_id}] AI ACTION: {side} {market_asset} ({trade_size_pct*100:.1f}%) ---")
         print(f"     Reason: {action.get('reason')}")
 
         current_price = self.active_markets.get(market_asset, {}).get('price')
@@ -292,63 +328,73 @@ class AgenticTrader:
             print(f"     ACTION FAILED: No price data for {market_asset}.")
             return (0, None, 0)
 
-        # --- NEW GUARDRAIL (matches prompt rule 2) ---
+        # Illiquid guardrail (matches prompt rule 2)
         if current_price < 0.001 or current_price > 0.999:
             print(f"     ACTION FAILED: Market is illiquid (Price: {current_price:.6f}). No trade.")
             return (0, None, 0)
-        
-        # --- 2. Process BUY Logic ---
+
+        # --- BUY logic ---
         if side == "BUY":
-            # Calculate quantity directly
             quantity_to_buy = round(STANDARD_TRADE_QUANTITY * trade_size_pct, 3)
 
             if quantity_to_buy < 0.001:
-                print(f"     ACTION FAILED: Trade quantity too small.")
+                print("     ACTION FAILED: Trade quantity too small.")
                 return (0, None, 0)
 
-            # Estimate cost for earmarking.
-            # We add a 50% buffer for slippage estimation, as this is just a
-            # client-side check. The server will do the *real* check.
             estimated_cost = quantity_to_buy * current_price
+            # 50% buffer for slippage estimation
             if (estimated_cost * 1.5) > available_usd:
-                print(f"     ACTION FAILED: Not enough *available* USD for trade. Need ~${estimated_cost * 1.5:.2f}, have ${available_usd:.2f}")
+                print(
+                    f"     ACTION FAILED: Not enough *available* USD for trade. "
+                    f"Need ~${estimated_cost * 1.5:.4f}, have ${available_usd:.4f}"
+                )
                 return (0, None, 0)
-                
-            await self.ws_exchange.send(json.dumps({
+
+            sent = await self._safe_send_to_exchange({
                 "action": "trade",
                 "market": market_asset,
-                "quantity": quantity_to_buy  # Positive for BUY
-            }))
-            print(f"     > Sent BUY for {quantity_to_buy} {market_asset}. (Estimated Cost: ${estimated_cost:.2f})")
-            
-            # Earmark the *estimated* cost. The server will charge the true cost.
-            return (estimated_cost, None, 0) 
+                "quantity": quantity_to_buy,  # Positive for BUY
+            })
+            if not sent:
+                print("     ACTION FAILED: Could not send BUY order to exchange.")
+                return (0, None, 0)
 
-        # --- 3. Process SELL Logic ---
+            print(f"     > Sent BUY for {quantity_to_buy} {market_asset}. (Estimated Cost: ${estimated_cost:.4f})")
+            # Earmark the estimated cost; server charges the true cost on-chain.
+            return (estimated_cost, None, 0)
+
+        # --- SELL logic ---
         elif side == "SELL":
-            available_tokens_for_market = available_tokens.get(market_asset, 0)
-            
-            # Calculate quantity directly
+            available_tokens_for_market = available_tokens.get(market_asset, 0.0)
             quantity_to_sell = round(STANDARD_TRADE_QUANTITY * trade_size_pct, 3)
 
-            # --- NEW GUARDRAIL (matches prompt rule 1) ---
+            # Guardrail: must own enough tokens
             if quantity_to_sell > available_tokens_for_market:
-                print(f"     ACTION FAILED: Not enough tokens for trade. Need {quantity_to_sell}, have {available_tokens_for_market}")
+                print(
+                    f"     ACTION FAILED: Not enough tokens for trade. "
+                    f"Need {quantity_to_sell}, have {available_tokens_for_market}"
+                )
                 return (0, None, 0)
 
             if quantity_to_sell < 0.001:
-                print(f"     ACTION FAILED: Trade quantity too small.")
+                print("     ACTION FAILED: Trade quantity too small.")
                 return (0, None, 0)
-            
-            await self.ws_exchange.send(json.dumps({
+
+            sent = await self._safe_send_to_exchange({
                 "action": "trade",
                 "market": market_asset,
-                "quantity": -quantity_to_sell  # Negative for SELL
-            }))
-            print(f"     > Sent SELL for {quantity_to_sell} {market_asset}.")
-            return (0, market_asset, quantity_to_sell)  # Earmark the tokens
+                "quantity": -quantity_to_sell,  # Negative for SELL
+            })
+            if not sent:
+                print("     ACTION FAILED: Could not send SELL order to exchange.")
+                return (0, None, 0)
 
+            print(f"     > Sent SELL for {quantity_to_sell} {market_asset}.")
+            return (0, market_asset, quantity_to_sell)
+
+        # Unknown side
         return (0, None, 0)
+
 
     async def run(self):
         """Main entry point for the agent."""
@@ -357,6 +403,9 @@ class AgenticTrader:
             print(f"[{self.agent_id}] Cannot run without a valid AI model.")
             return
 
+        # Start tweet listener once, independent of the exchange WS lifecycle.
+        asyncio.create_task(self._listen_to_tweets())
+
         while True:
             try:
                 async with websockets.connect(self.exchange_url) as ws:
@@ -364,13 +413,12 @@ class AgenticTrader:
                     print(f"[{self.agent_id}] Connected to exchange {self.exchange_url}")
 
                     await self.ws_exchange.send(json.dumps({
-                        "action": "register", "agent_id": self.agent_id
+                        "action": "register",
+                        "agent_id": self.agent_id
                     }))
 
-                    exchange_listener_task = asyncio.create_task(self._listen_to_exchange())
-                    tweet_listener_task = asyncio.create_task(self._listen_to_tweets())
-
-                    await asyncio.gather(exchange_listener_task, tweet_listener_task)
+                    # This returns when the exchange WS closes / errors.
+                    await self._listen_to_exchange()
 
             except websockets.exceptions.ConnectionClosed:
                 print(f"[{self.agent_id}] Main connection to exchange failed. Retrying in 5s...")
@@ -379,6 +427,7 @@ class AgenticTrader:
 
             self.ws_exchange = None
             await asyncio.sleep(5)
+
 
 
 # --- MANAGER FUNCTIONS ---
