@@ -413,13 +413,13 @@ def spawn_default_agents():
 
     spawn_agent_from_command({
         "name": "Trader_GPT",
-        "model": "openai/gpt-oss-20b:free",  # Using a more standard, reliable model
+        "model": "anthropic/claude-3-haiku",  # Using a more standard, reliable model
         "strategy": default_strategy_alpha
     })
 
     spawn_agent_from_command({
         "name": "Trader_Llama",
-        "model": "meta-llama/llama-4-maverick:free",  # A good, fast model
+        "model": "meta-llama/llama-3-8b-instruct",  # A good, fast model
         "strategy": default_strategy_beta
     })
 

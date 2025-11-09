@@ -1,4 +1,21 @@
-/* ADD THIS CSS to style.css */
+.form-group select {
+    width: 100%;
+    padding: 8px;
+    box-sizing: border-box;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-family: inherit;
+    font-size: 0.95rem;
+    background-color: #fff;
+    cursor: pointer;
+}
+
+.form-group select:focus {
+    border-color: #3498db;
+    outline: none;
+    box-shadow: 0 0 3px rgba(52, 152, 219, 0.3);
+}
+
 .form-group {
     margin-bottom: 15px;
 }
