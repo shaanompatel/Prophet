@@ -9,7 +9,8 @@ import time
 CONNECTED_CLIENTS = {} # Trader clients connected to this exchange
 ACCOUNTS = defaultdict(lambda: defaultdict(float))
 LMSR_MARKETS = {} # --- REPLACED ORDER_BOOKS ---
-RESOLVED_MARKETS = set() 
+RESOLVED_MARKETS = set()
+AGENT_MANAGER_WS = None
 
 # --- Configuration ---
 AI_ACTION_URL = "ws://localhost:8766"  # URL of *your* AI server
@@ -112,74 +113,109 @@ async def broadcast_price_update(market_name: str, individual_client=None):
 # --- REMOVED: match_orders ---
 
 async def trader_client_handler(websocket):
-    """Handles new traders AND spectators connecting to *this* exchange server."""
-    agent_id = None
-    client_type = "trader" # Default
-    try:
-        async for message in websocket:
-            data = json.loads(message)
-            action = data.get("action")
-            
-            if action == "register":
-                agent_id = data.get("agent_id")
-                if agent_id in CONNECTED_CLIENTS:
-                    await websocket.send(json.dumps({"type": "error", "message": "Agent ID already connected"}))
+        """Handles new traders AND spectators connecting to *this* exchange server."""
+        agent_id = None
+        client_type = "trader" # Default
+        global AGENT_MANAGER_WS # --- NEW ---
+        
+        try:
+            async for message in websocket:
+                data = json.loads(message)
+                action = data.get("action")
+                
+                if action == "register":
+                    # ... (this block is unchanged) ...
+                    agent_id = data.get("agent_id")
+                    if agent_id in CONNECTED_CLIENTS:
+                        await websocket.send(json.dumps({"type": "error", "message": "Agent ID already connected"}))
+                        continue
+                    
+                    CONNECTED_CLIENTS[agent_id] = websocket
+                    print(f"[TRADER REGISTER] Agent registered: {agent_id}")
+                    
+                    if agent_id == MAKER_AGENT_ID:
+                        if "USD" not in ACCOUNTS[agent_id]: ACCOUNTS[agent_id]["USD"] = MAKER_INITIAL_USD
+                    else:
+                        if "USD" not in ACCOUNTS[agent_id]: ACCOUNTS[agent_id]["USD"] = TRADER_INITIAL_USD
+                    
+                    await send_to_trader(agent_id, {"type": "registered", "agent_id": agent_id})
+                    await send_to_trader(agent_id, await get_account_update(agent_id))
+                
+                elif action == "register_spectator":
+                    # ... (this block is unchanged) ...
+                    client_type = "spectator"
+                    agent_id = f"spectator_{int(time.time() * 1000)}"
+                    CONNECTED_CLIENTS[agent_id] = websocket
+                    print(f"[SPECTATOR REGISTER] Spectator connected: {agent_id}")
+                    
+                    # --- SYNC FULL STATE ---
+                    for existing_agent, balances in ACCOUNTS.items():
+                        await send_to_trader(agent_id, {
+                            "type": "account_update", 
+                            "balances": balances,
+                            "agent_id": existing_agent
+                        })
+                    
+                    for market_name in LMSR_MARKETS:
+                        if market_name not in RESOLVED_MARKETS:
+                            # Note: The 'await' was missing here in your provided code, I've added it.
+                            await broadcast_price_update(market_name, individual_client=websocket)
+                    
+                    await send_to_trader(agent_id, {"type": "spectator_registered"})
+                
+                # --- NEW BLOCK FOR THE AGENT MANAGER ---
+                elif action == "register_manager":
+                    if AGENT_MANAGER_WS is not None:
+                        await websocket.send(json.dumps({"type": "error", "message": "Manager already connected"}))
+                        continue
+                    
+                    client_type = "manager"
+                    agent_id = "agent_manager"
+                    AGENT_MANAGER_WS = websocket
+                    print(f"[MANAGER REGISTER] Agent Manager connected: {agent_id}")
+                    # This connection will just stay open, listening for disconnects
+                    
+                # --- NEW BLOCK FOR SPAWNING ---
+                elif action == "spawn_agent":
+                    # This message comes from a spectator (frontend)
+                    if client_type != "spectator":
+                        continue # Only spectators can send this
+                        
+                    print(f"[EXCHANGE] Received spawn command from {agent_id}.")
+                    if AGENT_MANAGER_WS:
+                        # Forward the command to the manager
+                        await AGENT_MANAGER_WS.send(json.dumps({
+                            "type": "command_spawn_agent",
+                            "data": data # Forward the whole packet (name, model, strategy)
+                        }))
+                    else:
+                        await send_to_trader(agent_id, {"type": "error", "message": "Agent Manager is not connected."})
+
+                elif not agent_id:
+                    await websocket.send(json.dumps({"type": "error", "message": "You must register first"}))
                     continue
-                
-                CONNECTED_CLIENTS[agent_id] = websocket
-                print(f"[TRADER REGISTER] Agent registered: {agent_id}")
-                
-                if agent_id == MAKER_AGENT_ID:
-                    if "USD" not in ACCOUNTS[agent_id]: ACCOUNTS[agent_id]["USD"] = MAKER_INITIAL_USD
-                else:
-                    if "USD" not in ACCOUNTS[agent_id]: ACCOUNTS[agent_id]["USD"] = TRADER_INITIAL_USD
-                
-                await send_to_trader(agent_id, {"type": "registered", "agent_id": agent_id})
-                await send_to_trader(agent_id, await get_account_update(agent_id))
-            
-            # --- NEW BLOCK FOR THE FRONTEND ---
-            elif action == "register_spectator":
-                client_type = "spectator"
-                # Generate a unique ID for this spectator
-                agent_id = f"spectator_{int(time.time() * 1000)}"
-                CONNECTED_CLIENTS[agent_id] = websocket
-                print(f"[SPECTATOR REGISTER] Spectator connected: {agent_id}")
-                
-                # --- SYNC FULL STATE ---
-                # 1. Send all existing account balances
-                for existing_agent, balances in ACCOUNTS.items():
-                    await send_to_trader(agent_id, {
-                        "type": "account_update", 
-                        "balances": balances,
-                        "agent_id": existing_agent # Manually add agent_id for the frontend
-                    })
-                
-                # 2. Send all existing market prices
-                for market_name in LMSR_MARKETS:
-                    if market_name not in RESOLVED_MARKETS:
-                        await send_to_trader(agent_id, await broadcast_price_update(market_name, individual_client=websocket))
-                
-                await send_to_trader(agent_id, {"type": "spectator_registered"})
-                # This client is now in CONNECTED_CLIENTS and will get all future broadcasts
-            
-            elif not agent_id:
-                await websocket.send(json.dumps({"type": "error", "message": "You must register first"}))
-                continue
 
-            elif action == "trade":
-                if client_type == "spectator": # Spectators can't trade
-                     await websocket.send(json.dumps({"type": "error", "message": "Spectators cannot trade"}))
-                     continue
-                await handle_amm_trade(agent_id, data)
+                elif action == "trade":
+                    if client_type != "trader": # Spectators or Managers can't trade
+                         await websocket.send(json.dumps({"type": "error", "message": f"{client_type} cannot trade"}))
+                         continue
+                    await handle_amm_trade(agent_id, data)
 
-    except websockets.exceptions.ConnectionClosed:
-        if client_type == "spectator":
-             print(f"[SPECTATOR DISCONNECT] Spectator {agent_id} disconnected.")
-        else:
-            print(f"[TRADER DISCONNECT] Client {agent_id} disconnected.")
-    finally:
-        if agent_id in CONNECTED_CLIENTS:
-            del CONNECTED_CLIENTS[agent_id]
+        except websockets.exceptions.ConnectionClosed:
+            if client_type == "spectator":
+                 print(f"[SPECTATOR DISCONNECT] Spectator {agent_id} disconnected.")
+            elif client_type == "manager": # --- NEW ---
+                 print(f"[MANAGER DISCONNECT] Agent Manager disconnected.")
+                 AGENT_MANAGER_WS = None # Clear the connection
+            else:
+                print(f"[TRADER DISCONNECT] Client {agent_id} disconnected.")
+        finally:
+            if agent_id in CONNECTED_CLIENTS:
+                del CONNECTED_CLIENTS[agent_id]
+            
+            # --- NEW: Double-check manager is cleared ---
+            if websocket == AGENT_MANAGER_WS:
+                AGENT_MANAGER_WS = None
 
 # --- REPLACED: handle_place_order -> handle_amm_trade ---
 async def handle_amm_trade(agent_id, data):
